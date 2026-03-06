@@ -1,0 +1,310 @@
+"""
+GrapheneOS Cloner - ADB/Fastboot Wrapper
+Handles all communication with Android devices via adb and fastboot.
+All subprocess calls are silent (no terminal windows).
+"""
+import subprocess
+import os
+import re
+import time
+import threading
+from typing import List, Optional, Dict, Tuple, Callable
+
+from config import get_adb_path, get_fastboot_path
+
+# Subprocess creation flags for Windows (hide console window)
+CREATE_NO_WINDOW = 0x08000000
+
+
+def _run(cmd: List[str], timeout: int = 60) -> Tuple[int, str, str]:
+    """Run a command silently and return (returncode, stdout, stderr)."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": timeout,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+        kwargs["startupinfo"] = si
+
+    try:
+        proc = subprocess.run(cmd, **kwargs)
+        return proc.returncode, proc.stdout.decode("utf-8", errors="replace"), proc.stderr.decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return -1, "", "Command timed out"
+    except FileNotFoundError:
+        return -1, "", f"Binary not found: {cmd[0]}"
+
+
+def _run_stream(cmd: List[str], progress_callback: Optional[Callable] = None, timeout: int = 3600) -> Tuple[int, str]:
+    """Run a command and stream output line-by-line for progress tracking."""
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "bufsize": 1,
+        "universal_newlines": True,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        kwargs["startupinfo"] = si
+
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+        output_lines = []
+        for line in proc.stdout:
+            line = line.strip()
+            output_lines.append(line)
+            if progress_callback:
+                progress_callback(line)
+        proc.wait(timeout=timeout)
+        return proc.returncode, "\n".join(output_lines)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return -1, "Command timed out"
+    except FileNotFoundError:
+        return -1, f"Binary not found: {cmd[0]}"
+
+
+class ADBDevice:
+    """Represents a connected Android device."""
+
+    def __init__(self, serial: str, state: str, model: str = "", product: str = ""):
+        self.serial = serial
+        self.state = state
+        self.model = model
+        self.product = product
+
+    def __repr__(self):
+        return f"ADBDevice({self.serial}, {self.state}, {self.model})"
+
+
+class ADBWrapper:
+    """Wrapper around adb binary."""
+
+    def __init__(self, adb_path: Optional[str] = None):
+        self.adb = adb_path or get_adb_path()
+
+    def start_server(self) -> bool:
+        rc, out, err = _run([self.adb, "start-server"])
+        return rc == 0
+
+    def kill_server(self) -> bool:
+        rc, out, err = _run([self.adb, "kill-server"])
+        return rc == 0
+
+    def list_devices(self) -> List[ADBDevice]:
+        """List all connected ADB devices."""
+        rc, out, err = _run([self.adb, "devices", "-l"])
+        if rc != 0:
+            return []
+
+        devices = []
+        for line in out.strip().split("\n")[1:]:  # Skip header
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            serial = parts[0]
+            state = parts[1]
+            model = ""
+            product = ""
+            for p in parts[2:]:
+                if p.startswith("model:"):
+                    model = p.split(":", 1)[1]
+                elif p.startswith("product:"):
+                    product = p.split(":", 1)[1]
+            devices.append(ADBDevice(serial, state, model, product))
+        return devices
+
+    def get_device_info(self, serial: str) -> Dict[str, str]:
+        """Get detailed device info via adb shell getprop."""
+        info = {}
+        props = [
+            ("ro.product.model", "model"),
+            ("ro.product.device", "device"),
+            ("ro.build.display.id", "build"),
+            ("ro.build.version.release", "android_version"),
+            ("ro.serialno", "serial"),
+            ("ro.product.brand", "brand"),
+        ]
+        for prop, key in props:
+            rc, out, err = _run([self.adb, "-s", serial, "shell", "getprop", prop])
+            if rc == 0:
+                info[key] = out.strip()
+        return info
+
+    def get_installed_packages(self, serial: str) -> List[str]:
+        """Get list of installed packages (user + system)."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell", "pm", "list", "packages", "-f"])
+        if rc != 0:
+            return []
+        packages = []
+        for line in out.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("package:"):
+                # Format: package:/path/to/apk=com.example.app
+                match = re.match(r"package:(.+?)=(.+)", line)
+                if match:
+                    packages.append(match.group(2))
+        return sorted(packages)
+
+    def get_user_packages(self, serial: str) -> List[str]:
+        """Get list of user-installed packages only (third-party)."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell", "pm", "list", "packages", "-3"])
+        if rc != 0:
+            return []
+        packages = []
+        for line in out.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("package:"):
+                pkg = line.replace("package:", "").strip()
+                packages.append(pkg)
+        return sorted(packages)
+
+    def pull_file(self, serial: str, remote: str, local: str) -> bool:
+        """Pull a file from device to local."""
+        rc, out, err = _run([self.adb, "-s", serial, "pull", remote, local], timeout=300)
+        return rc == 0
+
+    def push_file(self, serial: str, local: str, remote: str) -> bool:
+        """Push a file from local to device."""
+        rc, out, err = _run([self.adb, "-s", serial, "push", local, remote], timeout=300)
+        return rc == 0
+
+    def shell(self, serial: str, command: str, timeout: int = 60) -> Tuple[int, str]:
+        """Run a shell command on device."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell", command], timeout=timeout)
+        return rc, out
+
+    def reboot(self, serial: str, mode: str = "") -> bool:
+        """Reboot device. mode can be '', 'bootloader', 'recovery'."""
+        cmd = [self.adb, "-s", serial, "reboot"]
+        if mode:
+            cmd.append(mode)
+        rc, out, err = _run(cmd, timeout=30)
+        return rc == 0
+
+    def reboot_to_bootloader(self, serial: str) -> bool:
+        """Reboot device into fastboot/bootloader mode."""
+        return self.reboot(serial, "bootloader")
+
+    def backup_app(self, serial: str, package: str, output_path: str) -> bool:
+        """Backup a single app's APK."""
+        # Get APK path
+        rc, out = self.shell(serial, f"pm path {package}")
+        if rc != 0:
+            return False
+        apk_path = out.strip().replace("package:", "")
+        if not apk_path:
+            return False
+        return self.pull_file(serial, apk_path, output_path)
+
+    def install_apk(self, serial: str, apk_path: str) -> bool:
+        """Install an APK on device."""
+        rc, out, err = _run([self.adb, "-s", serial, "install", "-r", apk_path], timeout=120)
+        return rc == 0 and "Success" in out
+
+    def wait_for_device(self, serial: str, timeout: int = 60) -> bool:
+        """Wait for device to come online."""
+        rc, out, err = _run([self.adb, "-s", serial, "wait-for-device"], timeout=timeout)
+        return rc == 0
+
+
+class FastbootWrapper:
+    """Wrapper around fastboot binary."""
+
+    def __init__(self, fastboot_path: Optional[str] = None):
+        self.fastboot = fastboot_path or get_fastboot_path()
+
+    def list_devices(self) -> List[Dict[str, str]]:
+        """List all devices in fastboot mode."""
+        rc, out, err = _run([self.fastboot, "devices", "-l"])
+        if rc != 0:
+            return []
+
+        devices = []
+        for line in out.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                devices.append({
+                    "serial": parts[0],
+                    "state": parts[1] if len(parts) > 1 else "fastboot",
+                })
+        return devices
+
+    def get_var(self, serial: str, var: str) -> Optional[str]:
+        """Get a fastboot variable."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "getvar", var], timeout=10)
+        # fastboot getvar outputs to stderr
+        combined = out + err
+        for line in combined.split("\n"):
+            if line.startswith(f"{var}:"):
+                return line.split(":", 1)[1].strip()
+        return None
+
+    def get_device_info(self, serial: str) -> Dict[str, str]:
+        """Get device info from fastboot variables."""
+        info = {}
+        for var in ["product", "serialno", "variant", "secure", "unlocked"]:
+            val = self.get_var(serial, var)
+            if val:
+                info[var] = val
+        return info
+
+    def flash_partition(self, serial: str, partition: str, image_path: str,
+                        progress_callback: Optional[Callable] = None) -> bool:
+        """Flash an image to a partition."""
+        cmd = [self.fastboot, "-s", serial, "flash", partition, image_path]
+        rc, output = _run_stream(cmd, progress_callback, timeout=1800)
+        return rc == 0
+
+    def erase_partition(self, serial: str, partition: str) -> bool:
+        """Erase a partition."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "erase", partition], timeout=60)
+        return rc == 0
+
+    def reboot(self, serial: str) -> bool:
+        """Reboot device from fastboot mode."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "reboot"], timeout=30)
+        return rc == 0
+
+    def reboot_to_bootloader(self, serial: str) -> bool:
+        """Reboot to bootloader from fastboot mode."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "reboot-bootloader"], timeout=30)
+        return rc == 0
+
+    def oem_unlock(self, serial: str) -> Tuple[bool, str]:
+        """Unlock the bootloader (OEM unlock)."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "flashing", "unlock"], timeout=60)
+        return rc == 0, out + err
+
+    def fetch_partition(self, serial: str, partition: str, output_path: str,
+                        progress_callback: Optional[Callable] = None) -> bool:
+        """Fetch (dump) a partition image from device.
+        Uses 'fastboot fetch' which is available in newer platform-tools.
+        Falls back to adb pull from /dev/block if fetch is not available.
+        """
+        cmd = [self.fastboot, "-s", serial, "fetch", partition, output_path]
+        rc, output = _run_stream(cmd, progress_callback, timeout=3600)
+        return rc == 0
+
+    def set_active_slot(self, serial: str, slot: str = "a") -> bool:
+        """Set the active slot (A/B devices)."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "set_active", slot], timeout=10)
+        return rc == 0
+
+    def flash_raw(self, serial: str, partition: str, image_path: str) -> bool:
+        """Flash a raw image without formatting."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "flash", partition, image_path], timeout=1800)
+        return rc == 0

@@ -1,0 +1,1112 @@
+"""
+GrapheneOS Cloner - Main GUI
+Full-featured desktop GUI for device cloning, imaging, backup and restore.
+"""
+import os
+import sys
+import time
+import threading
+from typing import Optional, List
+
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QProgressBar, QListWidget, QListWidgetItem,
+    QStackedWidget, QFrame, QTextEdit, QFileDialog,
+    QCheckBox, QGroupBox, QGridLayout, QMessageBox,
+    QComboBox, QSplitter, QScrollArea, QSizePolicy,
+    QSpacerItem, QApplication,
+)
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QSize, QThread
+from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
+
+from config import (
+    APP_NAME, APP_VERSION, PIXEL3_PARTITIONS,
+    get_default_image_dir, get_default_backup_dir,
+)
+from adb_wrapper import ADBWrapper, FastbootWrapper, ADBDevice
+from imaging import ImagingEngine, OperationCancelled
+
+
+# ─── Signal bridge for thread-safe GUI updates ───
+class WorkerSignals(QObject):
+    progress = pyqtSignal(int, int, str)       # current, total, message
+    status = pyqtSignal(str)                    # status text
+    finished = pyqtSignal(bool, str)            # success, message
+    log = pyqtSignal(str)                       # log line
+    device_list = pyqtSignal(list)              # list of devices
+
+
+# ─── Background Worker ───
+class Worker(QThread):
+    """Generic background worker for long-running operations."""
+
+    def __init__(self, func, *args, **kwargs):
+        super().__init__()
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            result = self.func(*self.args, **self.kwargs)
+            self.signals.finished.emit(True, str(result) if result else "Done")
+        except OperationCancelled:
+            self.signals.finished.emit(False, "Operation cancelled")
+        except Exception as e:
+            self.signals.finished.emit(False, f"Error: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN WINDOW
+# ═══════════════════════════════════════════════════════════════
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setMinimumSize(1100, 700)
+        self.resize(1200, 750)
+
+        # Core modules
+        self.adb = ADBWrapper()
+        self.fastboot = FastbootWrapper()
+        self.imaging = ImagingEngine(self.adb, self.fastboot)
+
+        # State
+        self.current_worker = None
+        self.adb_devices = []
+        self.fastboot_devices = []
+
+        self._build_ui()
+        self._start_device_poll()
+
+    # ──────────────────────────────────────────────
+    # UI CONSTRUCTION
+    # ──────────────────────────────────────────────
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ─ Top bar ─
+        top_bar = QFrame()
+        top_bar.setObjectName("topBar")
+        top_layout = QHBoxLayout(top_bar)
+        top_layout.setContentsMargins(20, 10, 20, 10)
+
+        title_col = QVBoxLayout()
+        lbl_title = QLabel(APP_NAME)
+        lbl_title.setObjectName("appTitle")
+        lbl_sub = QLabel(f"v{APP_VERSION}  •  Pixel 3 Device Cloning Tool")
+        lbl_sub.setObjectName("appSubtitle")
+        title_col.addWidget(lbl_title)
+        title_col.addWidget(lbl_sub)
+        top_layout.addLayout(title_col)
+        top_layout.addStretch()
+
+        # Device count indicator
+        self.device_count_label = QLabel("No devices")
+        self.device_count_label.setObjectName("statusLabel")
+        top_layout.addWidget(self.device_count_label)
+
+        # Refresh button
+        btn_refresh = QPushButton("⟳ Refresh")
+        btn_refresh.setFixedWidth(100)
+        btn_refresh.clicked.connect(self._poll_devices)
+        top_layout.addWidget(btn_refresh)
+
+        root_layout.addWidget(top_bar)
+
+        # ─ Body (sidebar + content) ─
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        # Sidebar
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 12, 0, 12)
+        sidebar_layout.setSpacing(0)
+
+        self.nav_buttons = []
+        pages = [
+            ("🏠  Dashboard", 0),
+            ("📸  Create Image", 1),
+            ("📋  Clone Device", 2),
+            ("💾  Backup", 3),
+            ("♻️  Restore", 4),
+            ("📱  App Selector", 5),
+            ("📜  Log", 6),
+        ]
+        for label, idx in pages:
+            btn = QPushButton(label)
+            btn.setObjectName("sidebarBtn")
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked, i=idx: self._navigate(i))
+            sidebar_layout.addWidget(btn)
+            self.nav_buttons.append(btn)
+
+        sidebar_layout.addStretch()
+
+        # Version label at bottom of sidebar
+        ver = QLabel(f"  v{APP_VERSION}")
+        ver.setObjectName("statusLabel")
+        sidebar_layout.addWidget(ver)
+
+        body.addWidget(sidebar)
+
+        # Stacked pages
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self._page_dashboard())
+        self.pages.addWidget(self._page_create_image())
+        self.pages.addWidget(self._page_clone())
+        self.pages.addWidget(self._page_backup())
+        self.pages.addWidget(self._page_restore())
+        self.pages.addWidget(self._page_app_selector())
+        self.pages.addWidget(self._page_log())
+        body.addWidget(self.pages)
+
+        root_layout.addLayout(body)
+
+        # ─ Status bar ─
+        status_bar = QFrame()
+        status_bar.setFixedHeight(32)
+        status_layout = QHBoxLayout(status_bar)
+        status_layout.setContentsMargins(20, 4, 20, 4)
+        self.global_status = QLabel("Ready")
+        self.global_status.setObjectName("statusLabel")
+        status_layout.addWidget(self.global_status)
+        status_layout.addStretch()
+        root_layout.addWidget(status_bar)
+
+        # Default to dashboard
+        self._navigate(0)
+
+    def _navigate(self, index):
+        self.pages.setCurrentIndex(index)
+        for i, btn in enumerate(self.nav_buttons):
+            btn.setProperty("active", "true" if i == index else "false")
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    # ──────────────────────────────────────────────
+    # PAGE: DASHBOARD
+    # ──────────────────────────────────────────────
+    def _page_dashboard(self):
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+
+        # Header
+        header = QLabel("Dashboard")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Connect your Pixel 3 devices via USB to get started. "
+                       "Enable USB debugging on your master phone and OEM unlocking on target devices.")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # Quick action cards
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(16)
+
+        cards = [
+            ("📸 Create Image", "Capture full system image\nfrom master device", 1, "#0f3460"),
+            ("📋 Clone Device", "Flash image onto\ntarget devices", 2, "#0f3460"),
+            ("💾 Backup", "Backup apps and data\nfrom any device", 3, "#0f3460"),
+            ("♻️ Restore", "Restore backup to\na device", 4, "#0f3460"),
+        ]
+        for title, desc_text, nav_idx, color in cards:
+            card = self._make_action_card(title, desc_text, nav_idx)
+            cards_layout.addWidget(card)
+
+        layout.addLayout(cards_layout)
+
+        # Connected devices section
+        dev_header = QLabel("Connected Devices")
+        dev_header.setObjectName("cardTitle")
+        layout.addWidget(dev_header)
+
+        self.dashboard_devices_layout = QVBoxLayout()
+        self.no_devices_label = QLabel("No devices detected. Connect a Pixel 3 via USB and enable USB debugging.")
+        self.no_devices_label.setObjectName("statusLabel")
+        self.dashboard_devices_layout.addWidget(self.no_devices_label)
+        layout.addLayout(self.dashboard_devices_layout)
+
+        layout.addStretch()
+
+        # Prerequisites info
+        prereq_box = QGroupBox("Prerequisites")
+        prereq_layout = QVBoxLayout(prereq_box)
+        prereq_items = [
+            "✓ USB Debugging enabled on master phone (Settings → Developer Options)",
+            "✓ OEM Unlocking enabled on target phones",
+            "✓ Good quality USB cables (preferably USB-C to USB-C)",
+            "✓ Google USB Driver installed (included in this package)",
+        ]
+        for item in prereq_items:
+            lbl = QLabel(item)
+            lbl.setStyleSheet("color: #8899aa; font-size: 12px;")
+            prereq_layout.addWidget(lbl)
+        layout.addWidget(prereq_box)
+
+        scroll.setWidget(content)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+        return page
+
+    def _make_action_card(self, title, description, nav_index):
+        card = QFrame()
+        card.setObjectName("card")
+        card.setFixedHeight(160)
+        card.setCursor(Qt.PointingHandCursor)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        layout = QVBoxLayout(card)
+        layout.setSpacing(8)
+
+        lbl_title = QLabel(title)
+        lbl_title.setObjectName("cardTitle")
+        layout.addWidget(lbl_title)
+
+        lbl_desc = QLabel(description)
+        lbl_desc.setObjectName("cardSubtitle")
+        lbl_desc.setWordWrap(True)
+        layout.addWidget(lbl_desc)
+
+        layout.addStretch()
+
+        btn = QPushButton("Open →")
+        btn.setObjectName("primaryBtn")
+        btn.clicked.connect(lambda: self._navigate(nav_index))
+        layout.addWidget(btn)
+
+        return card
+
+    # ──────────────────────────────────────────────
+    # PAGE: CREATE IMAGE
+    # ──────────────────────────────────────────────
+    def _page_create_image(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("Create Image")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Capture a full system image from your master Pixel 3. "
+                       "The device must be in fastboot mode.")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # Source device selector
+        grp_source = QGroupBox("Source Device")
+        src_layout = QHBoxLayout(grp_source)
+        self.img_device_combo = QComboBox()
+        self.img_device_combo.setMinimumWidth(300)
+        src_layout.addWidget(QLabel("Device:"))
+        src_layout.addWidget(self.img_device_combo)
+        src_layout.addStretch()
+
+        btn_reboot_fb = QPushButton("Reboot to Fastboot")
+        btn_reboot_fb.clicked.connect(self._reboot_to_fastboot_for_image)
+        src_layout.addWidget(btn_reboot_fb)
+        layout.addWidget(grp_source)
+
+        # Output directory
+        grp_output = QGroupBox("Output Location")
+        out_layout = QHBoxLayout(grp_output)
+        self.img_output_path = QLabel(get_default_image_dir())
+        self.img_output_path.setObjectName("statusLabel")
+        out_layout.addWidget(self.img_output_path)
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_image_output)
+        out_layout.addWidget(btn_browse)
+        layout.addWidget(grp_output)
+
+        # Partition selection
+        grp_parts = QGroupBox("Partitions to Capture")
+        parts_layout = QVBoxLayout(grp_parts)
+        self.img_partition_checks = {}
+        grid = QGridLayout()
+        for i, part in enumerate(PIXEL3_PARTITIONS):
+            cb = QCheckBox(part)
+            cb.setChecked(True)
+            self.img_partition_checks[part] = cb
+            grid.addWidget(cb, i // 4, i % 4)
+        parts_layout.addLayout(grid)
+
+        btn_row = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_all.clicked.connect(lambda: [cb.setChecked(True) for cb in self.img_partition_checks.values()])
+        btn_none = QPushButton("Select None")
+        btn_none.clicked.connect(lambda: [cb.setChecked(False) for cb in self.img_partition_checks.values()])
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        btn_row.addStretch()
+        parts_layout.addLayout(btn_row)
+        layout.addWidget(grp_parts)
+
+        # Progress
+        self.img_progress = QProgressBar()
+        self.img_progress.setVisible(False)
+        layout.addWidget(self.img_progress)
+
+        self.img_status = QLabel("")
+        self.img_status.setObjectName("statusLabel")
+        layout.addWidget(self.img_status)
+
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        self.btn_create_image = QPushButton("📸  Create Image")
+        self.btn_create_image.setObjectName("primaryBtn")
+        self.btn_create_image.clicked.connect(self._start_create_image)
+        btn_layout.addWidget(self.btn_create_image)
+
+        self.btn_cancel_image = QPushButton("Cancel")
+        self.btn_cancel_image.setObjectName("dangerBtn")
+        self.btn_cancel_image.setVisible(False)
+        self.btn_cancel_image.clicked.connect(self._cancel_operation)
+        btn_layout.addWidget(self.btn_cancel_image)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        return page
+
+    # ──────────────────────────────────────────────
+    # PAGE: CLONE DEVICE
+    # ──────────────────────────────────────────────
+    def _page_clone(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("Clone Device")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Flash a previously captured image onto one or more target Pixel 3 devices. "
+                       "Target devices must be in fastboot mode with OEM unlocked.")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # Image file selector
+        grp_img = QGroupBox("Image File")
+        img_layout = QHBoxLayout(grp_img)
+        self.clone_image_path = QLabel("No image selected")
+        self.clone_image_path.setObjectName("statusLabel")
+        img_layout.addWidget(self.clone_image_path)
+        btn_select = QPushButton("Select Image...")
+        btn_select.clicked.connect(self._browse_clone_image)
+        img_layout.addWidget(btn_select)
+        layout.addWidget(grp_img)
+
+        # Image info
+        self.clone_image_info = QLabel("")
+        self.clone_image_info.setObjectName("statusLabel")
+        self.clone_image_info.setWordWrap(True)
+        layout.addWidget(self.clone_image_info)
+
+        # Target devices
+        grp_targets = QGroupBox("Target Devices (Fastboot Mode)")
+        targets_layout = QVBoxLayout(grp_targets)
+        self.clone_device_list = QListWidget()
+        self.clone_device_list.setMaximumHeight(150)
+        targets_layout.addWidget(self.clone_device_list)
+
+        btn_refresh_targets = QPushButton("⟳ Refresh Devices")
+        btn_refresh_targets.clicked.connect(self._poll_devices)
+        targets_layout.addWidget(btn_refresh_targets)
+        layout.addWidget(grp_targets)
+
+        # Progress
+        self.clone_progress = QProgressBar()
+        self.clone_progress.setVisible(False)
+        layout.addWidget(self.clone_progress)
+
+        self.clone_status = QLabel("")
+        self.clone_status.setObjectName("statusLabel")
+        layout.addWidget(self.clone_status)
+
+        # Action buttons
+        btn_layout = QHBoxLayout()
+        self.btn_clone = QPushButton("📋  Clone to Selected Devices")
+        self.btn_clone.setObjectName("primaryBtn")
+        self.btn_clone.clicked.connect(self._start_clone)
+        btn_layout.addWidget(self.btn_clone)
+
+        self.btn_cancel_clone = QPushButton("Cancel")
+        self.btn_cancel_clone.setObjectName("dangerBtn")
+        self.btn_cancel_clone.setVisible(False)
+        self.btn_cancel_clone.clicked.connect(self._cancel_operation)
+        btn_layout.addWidget(self.btn_cancel_clone)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        return page
+
+    # ──────────────────────────────────────────────
+    # PAGE: BACKUP
+    # ──────────────────────────────────────────────
+    def _page_backup(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("Backup")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Create a full backup of apps from a connected device. "
+                       "The device should be in normal ADB mode (USB debugging ON).")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # Source device
+        grp_src = QGroupBox("Source Device (ADB Mode)")
+        src_layout = QHBoxLayout(grp_src)
+        self.backup_device_combo = QComboBox()
+        self.backup_device_combo.setMinimumWidth(300)
+        src_layout.addWidget(QLabel("Device:"))
+        src_layout.addWidget(self.backup_device_combo)
+        src_layout.addStretch()
+        layout.addWidget(grp_src)
+
+        # Output directory
+        grp_out = QGroupBox("Backup Location")
+        out_layout = QHBoxLayout(grp_out)
+        self.backup_output_path = QLabel(get_default_backup_dir())
+        self.backup_output_path.setObjectName("statusLabel")
+        out_layout.addWidget(self.backup_output_path)
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_backup_output)
+        out_layout.addWidget(btn_browse)
+        layout.addWidget(grp_out)
+
+        # Options
+        self.backup_include_apps = QCheckBox("Include user-installed apps (APKs)")
+        self.backup_include_apps.setChecked(True)
+        layout.addWidget(self.backup_include_apps)
+
+        # Progress
+        self.backup_progress = QProgressBar()
+        self.backup_progress.setVisible(False)
+        layout.addWidget(self.backup_progress)
+
+        self.backup_status = QLabel("")
+        self.backup_status.setObjectName("statusLabel")
+        layout.addWidget(self.backup_status)
+
+        # Action
+        btn_layout = QHBoxLayout()
+        self.btn_backup = QPushButton("💾  Create Backup")
+        self.btn_backup.setObjectName("primaryBtn")
+        self.btn_backup.clicked.connect(self._start_backup)
+        btn_layout.addWidget(self.btn_backup)
+
+        self.btn_cancel_backup = QPushButton("Cancel")
+        self.btn_cancel_backup.setObjectName("dangerBtn")
+        self.btn_cancel_backup.setVisible(False)
+        self.btn_cancel_backup.clicked.connect(self._cancel_operation)
+        btn_layout.addWidget(self.btn_cancel_backup)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        return page
+
+    # ──────────────────────────────────────────────
+    # PAGE: RESTORE
+    # ──────────────────────────────────────────────
+    def _page_restore(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("Restore")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Restore a backup or image file to a connected device. "
+                       "For full images (.gimg), device must be in fastboot mode. "
+                       "For app backups (.gbak), device should be in ADB mode.")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # File selector
+        grp_file = QGroupBox("Restore File")
+        file_layout = QHBoxLayout(grp_file)
+        self.restore_file_path = QLabel("No file selected")
+        self.restore_file_path.setObjectName("statusLabel")
+        file_layout.addWidget(self.restore_file_path)
+        btn_browse = QPushButton("Select File...")
+        btn_browse.clicked.connect(self._browse_restore_file)
+        file_layout.addWidget(btn_browse)
+        layout.addWidget(grp_file)
+
+        self.restore_file_info = QLabel("")
+        self.restore_file_info.setObjectName("statusLabel")
+        self.restore_file_info.setWordWrap(True)
+        layout.addWidget(self.restore_file_info)
+
+        # Target device
+        grp_target = QGroupBox("Target Device")
+        target_layout = QHBoxLayout(grp_target)
+        self.restore_device_combo = QComboBox()
+        self.restore_device_combo.setMinimumWidth(300)
+        target_layout.addWidget(QLabel("Device:"))
+        target_layout.addWidget(self.restore_device_combo)
+        target_layout.addStretch()
+        layout.addWidget(grp_target)
+
+        # Progress
+        self.restore_progress = QProgressBar()
+        self.restore_progress.setVisible(False)
+        layout.addWidget(self.restore_progress)
+
+        self.restore_status = QLabel("")
+        self.restore_status.setObjectName("statusLabel")
+        layout.addWidget(self.restore_status)
+
+        # Action
+        btn_layout = QHBoxLayout()
+        self.btn_restore = QPushButton("♻️  Restore")
+        self.btn_restore.setObjectName("primaryBtn")
+        self.btn_restore.clicked.connect(self._start_restore)
+        btn_layout.addWidget(self.btn_restore)
+
+        self.btn_cancel_restore = QPushButton("Cancel")
+        self.btn_cancel_restore.setObjectName("dangerBtn")
+        self.btn_cancel_restore.setVisible(False)
+        self.btn_cancel_restore.clicked.connect(self._cancel_operation)
+        btn_layout.addWidget(self.btn_cancel_restore)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+        return page
+
+    # ──────────────────────────────────────────────
+    # PAGE: APP SELECTOR
+    # ──────────────────────────────────────────────
+    def _page_app_selector(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("App Selector")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        desc = QLabel("Select which apps to include when cloning or restoring. "
+                       "Load apps from a connected device or from a saved image/backup file.")
+        desc.setObjectName("statusLabel")
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+
+        # Source selection
+        grp_src = QGroupBox("Load Apps From")
+        src_layout = QHBoxLayout(grp_src)
+
+        btn_from_device = QPushButton("📱 From Device")
+        btn_from_device.clicked.connect(self._load_apps_from_device)
+        src_layout.addWidget(btn_from_device)
+
+        btn_from_file = QPushButton("📁 From Image/Backup")
+        btn_from_file.clicked.connect(self._load_apps_from_file)
+        src_layout.addWidget(btn_from_file)
+        src_layout.addStretch()
+        layout.addWidget(grp_src)
+
+        # App list
+        self.app_list_widget = QListWidget()
+        self.app_list_widget.setSelectionMode(QListWidget.MultiSelection)
+        layout.addWidget(self.app_list_widget, 1)
+
+        # Select buttons
+        btn_row = QHBoxLayout()
+        btn_sel_all = QPushButton("Select All")
+        btn_sel_all.clicked.connect(self._select_all_apps)
+        btn_sel_none = QPushButton("Select None")
+        btn_sel_none.clicked.connect(self._select_no_apps)
+        self.app_count_label = QLabel("0 apps loaded")
+        self.app_count_label.setObjectName("statusLabel")
+        btn_row.addWidget(btn_sel_all)
+        btn_row.addWidget(btn_sel_none)
+        btn_row.addStretch()
+        btn_row.addWidget(self.app_count_label)
+        layout.addLayout(btn_row)
+
+        return page
+
+    # ──────────────────────────────────────────────
+    # PAGE: LOG
+    # ──────────────────────────────────────────────
+    def _page_log(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(16)
+
+        header = QLabel("Operation Log")
+        header.setObjectName("headerLabel")
+        layout.addWidget(header)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text, 1)
+
+        btn_clear = QPushButton("Clear Log")
+        btn_clear.clicked.connect(self.log_text.clear)
+        layout.addWidget(btn_clear, 0, Qt.AlignRight)
+
+        return page
+
+    # ──────────────────────────────────────────────
+    # DEVICE POLLING
+    # ──────────────────────────────────────────────
+    def _start_device_poll(self):
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self._poll_devices)
+        self.poll_timer.start(5000)  # Poll every 5 seconds
+        self._poll_devices()  # Initial poll
+
+    def _poll_devices(self):
+        """Poll for connected ADB and fastboot devices."""
+        try:
+            self.adb_devices = self.adb.list_devices()
+        except Exception:
+            self.adb_devices = []
+
+        try:
+            self.fastboot_devices = self.fastboot.list_devices()
+        except Exception:
+            self.fastboot_devices = []
+
+        total = len(self.adb_devices) + len(self.fastboot_devices)
+        self.device_count_label.setText(
+            f"{total} device{'s' if total != 1 else ''} connected"
+            if total > 0 else "No devices"
+        )
+
+        self._update_device_combos()
+        self._update_dashboard_devices()
+
+    def _update_device_combos(self):
+        """Update all device combo boxes."""
+        # ADB devices for image creation
+        self.img_device_combo.clear()
+        for d in self.adb_devices:
+            label = f"{d.serial} ({d.model or 'ADB'})"
+            self.img_device_combo.addItem(label, d.serial)
+        for d in self.fastboot_devices:
+            label = f"{d['serial']} (Fastboot)"
+            self.img_device_combo.addItem(label, d['serial'])
+
+        # Backup device (ADB only)
+        self.backup_device_combo.clear()
+        for d in self.adb_devices:
+            label = f"{d.serial} ({d.model or 'ADB'})"
+            self.backup_device_combo.addItem(label, d.serial)
+
+        # Clone targets (fastboot only)
+        self.clone_device_list.clear()
+        for d in self.fastboot_devices:
+            item = QListWidgetItem(f"{d['serial']} (Fastboot)")
+            item.setData(Qt.UserRole, d['serial'])
+            item.setCheckState(Qt.Checked)
+            self.clone_device_list.addItem(item)
+
+        # Restore device
+        self.restore_device_combo.clear()
+        for d in self.adb_devices:
+            label = f"{d.serial} ({d.model or 'ADB'})"
+            self.restore_device_combo.addItem(label, d.serial)
+        for d in self.fastboot_devices:
+            label = f"{d['serial']} (Fastboot)"
+            self.restore_device_combo.addItem(label, d['serial'])
+
+    def _update_dashboard_devices(self):
+        """Update the dashboard devices list."""
+        # Clear existing device cards (keep the no_devices_label)
+        while self.dashboard_devices_layout.count() > 1:
+            item = self.dashboard_devices_layout.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+
+        total = len(self.adb_devices) + len(self.fastboot_devices)
+        self.no_devices_label.setVisible(total == 0)
+
+        for d in self.adb_devices:
+            card = self._make_device_card(d.serial, d.model or "Pixel 3", "ADB Mode", "#2ecc71")
+            self.dashboard_devices_layout.addWidget(card)
+
+        for d in self.fastboot_devices:
+            card = self._make_device_card(d['serial'], "Pixel 3", "Fastboot Mode", "#f39c12")
+            self.dashboard_devices_layout.addWidget(card)
+
+    def _make_device_card(self, serial, model, mode, color):
+        card = QFrame()
+        card.setObjectName("deviceCard")
+        layout = QHBoxLayout(card)
+
+        info_col = QVBoxLayout()
+        name = QLabel(f"📱  {model}")
+        name.setObjectName("deviceName")
+        info_col.addWidget(name)
+        ser = QLabel(f"Serial: {serial}")
+        ser.setObjectName("deviceSerial")
+        info_col.addWidget(ser)
+        layout.addLayout(info_col)
+
+        layout.addStretch()
+
+        status = QLabel(f"● {mode}")
+        status.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px;")
+        layout.addWidget(status)
+
+        return card
+
+    # ──────────────────────────────────────────────
+    # ACTIONS
+    # ──────────────────────────────────────────────
+    def _log(self, msg):
+        """Append to operation log."""
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {msg}")
+        self.global_status.setText(msg)
+
+    def _reboot_to_fastboot_for_image(self):
+        idx = self.img_device_combo.currentIndex()
+        if idx < 0:
+            return
+        serial = self.img_device_combo.currentData()
+        if serial:
+            self._log(f"Rebooting {serial} to fastboot...")
+            self.adb.reboot_to_bootloader(serial)
+            self._log("Device will appear in fastboot mode shortly. Click Refresh.")
+
+    def _browse_image_output(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Output Directory", get_default_image_dir())
+        if path:
+            self.img_output_path.setText(path)
+
+    def _browse_clone_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image File", get_default_image_dir(),
+            "GrapheneOS Image (*.gimg);;All Files (*.*)"
+        )
+        if path:
+            self.clone_image_path.setText(path)
+            manifest = ImagingEngine.read_archive_manifest(path)
+            if manifest:
+                self.clone_image_info.setText(
+                    f"Model: {manifest.get('device_model', 'N/A')}  |  "
+                    f"Created: {manifest.get('created_at', 'N/A')}  |  "
+                    f"Partitions: {', '.join(manifest.get('partitions', []))}"
+                )
+
+    def _browse_backup_output(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Backup Directory", get_default_backup_dir())
+        if path:
+            self.backup_output_path.setText(path)
+
+    def _browse_restore_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Restore File", "",
+            "GrapheneOS Files (*.gimg *.gbak);;All Files (*.*)"
+        )
+        if path:
+            self.restore_file_path.setText(path)
+            manifest = ImagingEngine.read_archive_manifest(path)
+            if manifest:
+                file_type = "Full Image" if path.endswith(".gimg") else "App Backup"
+                self.restore_file_info.setText(
+                    f"Type: {file_type}  |  "
+                    f"Model: {manifest.get('device_model', 'N/A')}  |  "
+                    f"Created: {manifest.get('created_at', 'N/A')}"
+                )
+
+    def _cancel_operation(self):
+        if self.imaging:
+            self.imaging.cancel()
+        self._log("Cancellation requested...")
+
+    def _start_create_image(self):
+        idx = self.img_device_combo.currentIndex()
+        if idx < 0:
+            QMessageBox.warning(self, "No Device", "No device selected. Connect a device first.")
+            return
+
+        serial = self.img_device_combo.currentData()
+        output = self.img_output_path.text()
+        partitions = [p for p, cb in self.img_partition_checks.items() if cb.isChecked()]
+
+        if not partitions:
+            QMessageBox.warning(self, "No Partitions", "Select at least one partition to capture.")
+            return
+
+        self._log(f"Starting image creation from {serial}...")
+        self.img_progress.setVisible(True)
+        self.img_progress.setValue(0)
+        self.btn_create_image.setEnabled(False)
+        self.btn_cancel_image.setVisible(True)
+
+        def do_work():
+            return self.imaging.create_image(
+                serial, output, partitions,
+                progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.img_progress),
+                status_callback=lambda s: self._worker_status(s, self.img_status),
+            )
+
+        self._run_worker(do_work, self._on_image_done)
+
+    def _on_image_done(self, success, message):
+        self.btn_create_image.setEnabled(True)
+        self.btn_cancel_image.setVisible(False)
+        if success:
+            self.img_progress.setValue(100)
+            self.img_status.setText(f"✅ Image created: {message}")
+            self._log(f"Image created successfully: {message}")
+        else:
+            self.img_status.setText(f"❌ {message}")
+            self._log(f"Image creation failed: {message}")
+
+    def _start_clone(self):
+        image_path = self.clone_image_path.text()
+        if not os.path.isfile(image_path):
+            QMessageBox.warning(self, "No Image", "Select a valid image file first.")
+            return
+
+        # Get selected target devices
+        targets = []
+        for i in range(self.clone_device_list.count()):
+            item = self.clone_device_list.item(i)
+            if item.checkState() == Qt.Checked:
+                targets.append(item.data(Qt.UserRole))
+
+        if not targets:
+            QMessageBox.warning(self, "No Targets", "No target devices selected.")
+            return
+
+        self._log(f"Starting clone to {len(targets)} device(s)...")
+        self.clone_progress.setVisible(True)
+        self.clone_progress.setValue(0)
+        self.btn_clone.setEnabled(False)
+        self.btn_cancel_clone.setVisible(True)
+
+        def do_work():
+            results = []
+            for serial in targets:
+                self._worker_status(f"Cloning to {serial}...", self.clone_status)
+                success = self.imaging.restore_image(
+                    serial, image_path,
+                    progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.clone_progress),
+                    status_callback=lambda s: self._worker_status(s, self.clone_status),
+                )
+                results.append((serial, success))
+            return results
+
+        self._run_worker(do_work, self._on_clone_done)
+
+    def _on_clone_done(self, success, message):
+        self.btn_clone.setEnabled(True)
+        self.btn_cancel_clone.setVisible(False)
+        if success:
+            self.clone_progress.setValue(100)
+            self.clone_status.setText("✅ Clone complete!")
+            self._log("Clone operation completed successfully")
+        else:
+            self.clone_status.setText(f"❌ {message}")
+            self._log(f"Clone operation failed: {message}")
+
+    def _start_backup(self):
+        idx = self.backup_device_combo.currentIndex()
+        if idx < 0:
+            QMessageBox.warning(self, "No Device", "No ADB device selected.")
+            return
+
+        serial = self.backup_device_combo.currentData()
+        output = self.backup_output_path.text()
+        include_apps = self.backup_include_apps.isChecked()
+
+        self._log(f"Starting backup of {serial}...")
+        self.backup_progress.setVisible(True)
+        self.backup_progress.setValue(0)
+        self.btn_backup.setEnabled(False)
+        self.btn_cancel_backup.setVisible(True)
+
+        def do_work():
+            return self.imaging.create_backup(
+                serial, output, include_apps,
+                progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.backup_progress),
+                status_callback=lambda s: self._worker_status(s, self.backup_status),
+            )
+
+        self._run_worker(do_work, self._on_backup_done)
+
+    def _on_backup_done(self, success, message):
+        self.btn_backup.setEnabled(True)
+        self.btn_cancel_backup.setVisible(False)
+        if success:
+            self.backup_progress.setValue(100)
+            self.backup_status.setText(f"✅ Backup created: {message}")
+            self._log(f"Backup created: {message}")
+        else:
+            self.backup_status.setText(f"❌ {message}")
+            self._log(f"Backup failed: {message}")
+
+    def _start_restore(self):
+        file_path = self.restore_file_path.text()
+        if not os.path.isfile(file_path):
+            QMessageBox.warning(self, "No File", "Select a valid backup/image file first.")
+            return
+
+        idx = self.restore_device_combo.currentIndex()
+        if idx < 0:
+            QMessageBox.warning(self, "No Device", "No target device selected.")
+            return
+
+        serial = self.restore_device_combo.currentData()
+
+        self._log(f"Starting restore to {serial}...")
+        self.restore_progress.setVisible(True)
+        self.restore_progress.setValue(0)
+        self.btn_restore.setEnabled(False)
+        self.btn_cancel_restore.setVisible(True)
+
+        def do_work():
+            if file_path.endswith(".gbak"):
+                # App backup restore
+                selected = self._get_selected_apps()
+                return self.imaging.restore_backup(
+                    serial, file_path, selected,
+                    progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.restore_progress),
+                    status_callback=lambda s: self._worker_status(s, self.restore_status),
+                )
+            else:
+                # Full image restore
+                return self.imaging.restore_image(
+                    serial, file_path,
+                    progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.restore_progress),
+                    status_callback=lambda s: self._worker_status(s, self.restore_status),
+                )
+
+        self._run_worker(do_work, self._on_restore_done)
+
+    def _on_restore_done(self, success, message):
+        self.btn_restore.setEnabled(True)
+        self.btn_cancel_restore.setVisible(False)
+        if success:
+            self.restore_progress.setValue(100)
+            self.restore_status.setText("✅ Restore complete!")
+            self._log("Restore completed successfully")
+        else:
+            self.restore_status.setText(f"❌ {message}")
+            self._log(f"Restore failed: {message}")
+
+    # ──────────────────────────────────────────────
+    # APP SELECTOR
+    # ──────────────────────────────────────────────
+    def _load_apps_from_device(self):
+        if not self.adb_devices:
+            QMessageBox.information(self, "No Device", "Connect a device in ADB mode first.")
+            return
+        serial = self.adb_devices[0].serial
+        self._log(f"Loading app list from {serial}...")
+        apps = self.adb.get_user_packages(serial)
+        self._populate_app_list(apps)
+
+    def _load_apps_from_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image/Backup", "",
+            "GrapheneOS Files (*.gimg *.gbak);;All Files (*.*)"
+        )
+        if path:
+            apps = ImagingEngine.get_archive_apps(path)
+            self._populate_app_list(apps)
+
+    def _populate_app_list(self, apps):
+        self.app_list_widget.clear()
+        for pkg in apps:
+            item = QListWidgetItem(pkg)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.app_list_widget.addItem(item)
+        self.app_count_label.setText(f"{len(apps)} apps loaded")
+
+    def _select_all_apps(self):
+        for i in range(self.app_list_widget.count()):
+            self.app_list_widget.item(i).setCheckState(Qt.Checked)
+
+    def _select_no_apps(self):
+        for i in range(self.app_list_widget.count()):
+            self.app_list_widget.item(i).setCheckState(Qt.Unchecked)
+
+    def _get_selected_apps(self):
+        """Get list of checked app package names."""
+        selected = []
+        for i in range(self.app_list_widget.count()):
+            item = self.app_list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                selected.append(item.text())
+        return selected if selected else None
+
+    # ──────────────────────────────────────────────
+    # WORKER HELPERS
+    # ──────────────────────────────────────────────
+    def _run_worker(self, func, on_done):
+        """Run a function in a background thread."""
+        self.current_worker = Worker(func)
+        self.current_worker.signals.finished.connect(on_done)
+        self.current_worker.start()
+
+    def _worker_progress(self, current, total, message, progress_bar):
+        """Thread-safe progress update."""
+        if total > 0:
+            pct = int((current / total) * 100)
+            QApplication.instance().postEvent(
+                progress_bar,
+                _ProgressEvent(pct)
+            )
+
+    def _worker_status(self, message, label):
+        """Thread-safe status update."""
+        # Use QTimer for thread safety
+        QTimer.singleShot(0, lambda: label.setText(message))
+        QTimer.singleShot(0, lambda: self._log(message))
+
+
+# Custom event for progress updates
+from PyQt5.QtCore import QEvent
+
+class _ProgressEvent(QEvent):
+    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+
+    def __init__(self, value):
+        super().__init__(self.EVENT_TYPE)
+        self.value = value
