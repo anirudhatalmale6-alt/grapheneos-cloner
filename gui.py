@@ -239,7 +239,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(dev_header)
 
         self.dashboard_devices_layout = QVBoxLayout()
-        self.no_devices_label = QLabel("No devices detected. Connect a Pixel 3 via USB and enable USB debugging.")
+        self.no_devices_label = QLabel("No devices detected.\n\n"
+            "Checklist:\n"
+            "1. Place adb.exe & fastboot.exe in the 'tools' folder\n"
+            "2. Enable USB Debugging on your phone (Settings → System → Developer Options)\n"
+            "3. Install Google USB Driver on your Windows PC\n"
+            "4. Connect phone via USB and accept the 'Allow USB debugging' prompt on screen")
         self.no_devices_label.setObjectName("statusLabel")
         self.dashboard_devices_layout.addWidget(self.no_devices_label)
         layout.addLayout(self.dashboard_devices_layout)
@@ -762,11 +767,11 @@ class MainWindow(QMainWindow):
         self.no_devices_label.setVisible(total == 0)
 
         for d in self.adb_devices:
-            card = self._make_device_card(d.serial, d.model or "Pixel 3", "ADB Mode", "#2ecc71")
+            card = self._make_device_card(d.serial, d.model or "Pixel Device", "ADB Mode", "#2ecc71")
             self.dashboard_devices_layout.addWidget(card)
 
         for d in self.fastboot_devices:
-            card = self._make_device_card(d['serial'], "Pixel 3", "Fastboot Mode", "#f39c12")
+            card = self._make_device_card(d['serial'], d.get('product', 'Pixel Device'), "Fastboot Mode", "#f39c12")
             self.dashboard_devices_layout.addWidget(card)
 
     def _make_device_card(self, serial, model, mode, color):
