@@ -16,6 +16,8 @@ from config import (
     PIXEL3_PARTITIONS, SYSTEM_PARTITIONS, DATA_PARTITION,
     IMAGE_EXTENSION, ARCHIVE_EXTENSION, BACKUP_EXTENSION,
     get_default_image_dir, get_default_backup_dir,
+    get_partitions_for_device, get_device_friendly_name,
+    DEVICE_PARTITIONS, DEFAULT_PARTITIONS,
 )
 from adb_wrapper import ADBWrapper, FastbootWrapper
 
@@ -70,7 +72,6 @@ class ImagingEngine:
             Path to the created .gimg archive
         """
         self._cancel_flag = False
-        partitions = partitions or PIXEL3_PARTITIONS
 
         if status_callback:
             status_callback("Preparing to create image...")
@@ -79,11 +80,18 @@ class ImagingEngine:
         temp_dir = tempfile.mkdtemp(prefix="gcloner_")
 
         try:
-            # Get device info
+            # Get device info and auto-detect partition layout
             if status_callback:
                 status_callback("Getting device information...")
 
             device_info = self.fastboot.get_device_info(serial)
+            device_codename = device_info.get("product", "").lower()
+            friendly_name = get_device_friendly_name(device_codename)
+
+            if not partitions:
+                partitions = get_partitions_for_device(device_codename)
+                if status_callback:
+                    status_callback(f"Detected device: {friendly_name} ({device_codename})")
             total_steps = len(partitions) + 2  # partitions + manifest + archive
             current_step = 0
 
