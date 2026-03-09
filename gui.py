@@ -255,10 +255,11 @@ class MainWindow(QMainWindow):
         prereq_box = QGroupBox("Prerequisites")
         prereq_layout = QVBoxLayout(prereq_box)
         prereq_items = [
-            "✓ USB Debugging enabled on master phone (Settings → Developer Options)",
-            "✓ OEM Unlocking enabled on target phones",
+            "✓ USB Debugging enabled (Settings → System → Developer Options)",
+            "✓ Root access enabled on master phone (Developer Options → 'Enable root access via ADB')",
+            "✓ OEM Unlocking enabled on target phones (for cloning)",
             "✓ Good quality USB cables (preferably USB-C to USB-C)",
-            "✓ Google USB Driver installed (included in this package)",
+            "✓ Google USB Driver installed on Windows PC",
         ]
         for item in prereq_items:
             lbl = QLabel(item)
@@ -313,8 +314,9 @@ class MainWindow(QMainWindow):
         header.setObjectName("headerLabel")
         layout.addWidget(header)
 
-        desc = QLabel("Capture a full system image from your master Pixel 3. "
-                       "The device must be in fastboot mode.")
+        desc = QLabel("Capture a full system image from your master Pixel device. "
+                       "The device should be connected via USB with USB Debugging ON. "
+                       "Root access must be enabled in Developer Options for partition reading.")
         desc.setObjectName("statusLabel")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -875,7 +877,17 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Partitions", "Select at least one partition to capture.")
             return
 
-        self._log(f"Starting image creation from {serial}...")
+        # Detect if device is in ADB or fastboot mode
+        is_adb = any(d.serial == serial for d in self.adb_devices)
+        is_fastboot = any(d['serial'] == serial for d in self.fastboot_devices)
+        mode = "adb" if is_adb else "fastboot"
+
+        if is_adb:
+            self._log(f"Starting image creation from {serial} (ADB mode - no reboot needed)...")
+            self._log("Tip: Ensure root access is enabled in Settings → System → Developer Options")
+        else:
+            self._log(f"Starting image creation from {serial} (Fastboot mode)...")
+
         self.img_progress.setVisible(True)
         self.img_progress.setValue(0)
         self.btn_create_image.setEnabled(False)
@@ -883,7 +895,7 @@ class MainWindow(QMainWindow):
 
         def do_work():
             return self.imaging.create_image(
-                serial, output, partitions,
+                serial, output, partitions, mode=mode,
                 progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.img_progress),
                 status_callback=lambda s: self._worker_status(s, self.img_status),
             )

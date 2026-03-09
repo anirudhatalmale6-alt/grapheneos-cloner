@@ -217,6 +217,108 @@ class ADBWrapper:
         rc, out, err = _run([self.adb, "-s", serial, "wait-for-device"], timeout=timeout)
         return rc == 0
 
+    def enable_root(self, serial: str) -> bool:
+        """Enable ADB root access (requires root enabled in Developer Options on GrapheneOS)."""
+        rc, out, err = _run([self.adb, "-s", serial, "root"], timeout=15)
+        if rc == 0:
+            time.sleep(2)  # Wait for adb to reconnect after root
+            return True
+        return False
+
+    def is_root(self, serial: str) -> bool:
+        """Check if ADB is running as root."""
+        rc, out = self.shell(serial, "id")
+        return rc == 0 and "uid=0" in out
+
+    def get_partition_path(self, serial: str, partition: str) -> Optional[str]:
+        """Find the block device path for a partition name."""
+        # Try by-name symlink first (most common on Pixel devices)
+        for prefix in ["/dev/block/by-name/", "/dev/block/platform/*/by-name/",
+                       "/dev/block/bootdevice/by-name/"]:
+            rc, out = self.shell(serial, f"ls {prefix}{partition} 2>/dev/null")
+            if rc == 0 and out.strip():
+                return out.strip()
+
+        # Try reading from /dev/block/by-name with slot suffix (A/B devices)
+        for suffix in ["_a", "_b"]:
+            rc, out = self.shell(serial, f"ls /dev/block/by-name/{partition}{suffix} 2>/dev/null")
+            if rc == 0 and out.strip():
+                return out.strip()
+
+        return None
+
+    def dump_partition(self, serial: str, partition: str, output_path: str,
+                       progress_callback: Optional[Callable] = None) -> bool:
+        """Dump a partition using ADB with dd. Requires root access.
+        This is the most reliable method for reading partitions.
+        """
+        block_path = self.get_partition_path(serial, partition)
+        if not block_path:
+            # Fallback: try direct path
+            block_path = f"/dev/block/by-name/{partition}"
+
+        if progress_callback:
+            progress_callback(f"Reading {partition} from {block_path}...")
+
+        # Get partition size first
+        rc, size_out = self.shell(serial, f"blockdev --getsize64 {block_path} 2>/dev/null")
+        total_bytes = int(size_out.strip()) if rc == 0 and size_out.strip().isdigit() else 0
+
+        # Use adb exec-out with dd to stream partition data to local file
+        cmd = [self.adb, "-s", serial, "exec-out",
+               "dd", f"if={block_path}", "bs=4194304"]  # 4MB blocks
+
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = CREATE_NO_WINDOW
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            kwargs["startupinfo"] = si
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            bytes_written = 0
+            block_size = 4194304  # 4MB
+
+            with open(output_path, "wb") as f:
+                while True:
+                    data = proc.stdout.read(block_size)
+                    if not data:
+                        break
+                    f.write(data)
+                    bytes_written += len(data)
+
+                    if progress_callback and total_bytes > 0:
+                        pct = min(100, int(bytes_written * 100 / total_bytes))
+                        progress_callback(f"{partition}: {bytes_written // 1048576}MB / {total_bytes // 1048576}MB ({pct}%)")
+                    elif progress_callback:
+                        progress_callback(f"{partition}: {bytes_written // 1048576}MB written")
+
+            proc.wait(timeout=30)
+
+            # Verify we got actual data
+            if bytes_written == 0:
+                if progress_callback:
+                    progress_callback(f"WARNING: No data read from {partition}")
+                return False
+
+            if progress_callback:
+                progress_callback(f"{partition}: Done ({bytes_written // 1048576}MB)")
+            return True
+
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"ERROR dumping {partition}: {str(e)}")
+            return False
+
+    def get_user_packages(self, serial: str) -> List[str]:
+        """Get list of user-installed packages."""
+        return self.get_installed_packages(serial)
+
 
 class FastbootWrapper:
     """Wrapper around fastboot binary."""
@@ -293,10 +395,9 @@ class FastbootWrapper:
                         progress_callback: Optional[Callable] = None) -> bool:
         """Fetch (dump) a partition image from device.
         Uses 'fastboot fetch' which is available in newer platform-tools.
-        Falls back to adb pull from /dev/block if fetch is not available.
         """
         cmd = [self.fastboot, "-s", serial, "fetch", partition, output_path]
-        rc, output = _run_stream(cmd, progress_callback, timeout=3600)
+        rc, output = _run_stream(cmd, progress_callback, timeout=300)
         return rc == 0
 
     def set_active_slot(self, serial: str, slot: str = "a") -> bool:

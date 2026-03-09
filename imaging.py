@@ -55,16 +55,18 @@ class ImagingEngine:
 
     def create_image(self, serial: str, output_path: str,
                      partitions: Optional[List[str]] = None,
+                     mode: str = "adb",
                      progress_callback: Optional[Callable] = None,
                      status_callback: Optional[Callable] = None) -> str:
         """
         Create a full device image from a connected device.
-        The device should be in fastboot mode.
+        Uses ADB with root (primary) or fastboot (fallback) to dump partitions.
 
         Args:
             serial: Device serial number
             output_path: Directory to save the image archive
             partitions: List of partitions to capture (default: all)
+            mode: "adb" (device in ADB mode, requires root) or "fastboot"
             progress_callback: Called with (current_step, total_steps, message)
             status_callback: Called with status message strings
 
@@ -84,19 +86,44 @@ class ImagingEngine:
             if status_callback:
                 status_callback("Getting device information...")
 
-            device_info = self.fastboot.get_device_info(serial)
-            device_codename = device_info.get("product", "").lower()
+            if mode == "adb":
+                device_info = self.adb.get_device_info(serial)
+                device_codename = device_info.get("device", "").lower()
+
+                # Enable root access for partition reading
+                if status_callback:
+                    status_callback("Enabling root access...")
+                if not self.adb.enable_root(serial):
+                    if status_callback:
+                        status_callback("WARNING: Could not enable root. Ensure root access is enabled in Developer Options.")
+                    # Try anyway - some devices allow dd without explicit root
+            else:
+                device_info = self.fastboot.get_device_info(serial)
+                device_codename = device_info.get("product", "").lower()
+
             friendly_name = get_device_friendly_name(device_codename)
 
             if not partitions:
                 partitions = get_partitions_for_device(device_codename)
-                if status_callback:
-                    status_callback(f"Detected device: {friendly_name} ({device_codename})")
+
+            if status_callback:
+                status_callback(f"Detected device: {friendly_name} ({device_codename})")
+                status_callback(f"Will dump {len(partitions)} partitions: {', '.join(partitions)}")
+
             total_steps = len(partitions) + 2  # partitions + manifest + archive
             current_step = 0
 
-            # Get app list via ADB if device was in ADB mode before
+            # Get app list via ADB
             app_list = []
+            if mode == "adb":
+                try:
+                    app_list = self.adb.get_installed_packages(serial)
+                    if status_callback:
+                        status_callback(f"Found {len(app_list)} installed apps")
+                except Exception:
+                    pass
+
+            failed_partitions = []
 
             # Dump each partition
             for partition in partitions:
@@ -110,20 +137,32 @@ class ImagingEngine:
 
                 img_path = os.path.join(temp_dir, f"{partition}{IMAGE_EXTENSION}")
 
-                def _part_progress(line):
+                def _part_progress(line, _p=partition):
                     if status_callback:
-                        status_callback(f"  {partition}: {line}")
+                        status_callback(f"  {line}")
 
-                success = self.fastboot.fetch_partition(serial, partition, img_path, _part_progress)
+                success = False
+
+                if mode == "adb":
+                    # Primary method: ADB with dd
+                    success = self.adb.dump_partition(serial, partition, img_path, _part_progress)
+
+                if not success and mode == "fastboot":
+                    # Fastboot fetch method
+                    success = self.fastboot.fetch_partition(serial, partition, img_path, _part_progress)
+
                 if not success:
-                    # Try alternative method: use dd via adb
+                    failed_partitions.append(partition)
                     if status_callback:
-                        status_callback(f"  Fetch failed for {partition}, trying alternative method...")
-                    # We'll create an empty placeholder and note it
+                        status_callback(f"  WARNING: Could not dump {partition}")
+                    # Create empty placeholder
                     with open(img_path, 'wb') as f:
-                        pass  # Empty file as placeholder
+                        pass
 
             self._check_cancel()
+
+            if failed_partitions and status_callback:
+                status_callback(f"Note: {len(failed_partitions)} partition(s) could not be read: {', '.join(failed_partitions)}")
 
             # Create manifest
             current_step += 1
@@ -137,12 +176,12 @@ class ImagingEngine:
             )
 
             manifest = ImageManifest(
-                device_serial=device_info.get("serialno", serial),
-                device_model=device_info.get("product", "blueline"),
-                device_product=device_info.get("product", "Pixel 3"),
-                grapheneos_build=device_info.get("variant", "unknown"),
+                device_serial=device_info.get("serial", device_info.get("serialno", serial)),
+                device_model=device_codename or "unknown",
+                device_product=friendly_name,
+                grapheneos_build=device_info.get("build", device_info.get("variant", "unknown")),
                 created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-                partitions=partitions,
+                partitions=[p for p in partitions if p not in failed_partitions],
                 app_list=app_list,
                 total_size_bytes=total_size,
             )
@@ -154,13 +193,13 @@ class ImagingEngine:
             # Create compressed archive
             current_step += 1
             if status_callback:
-                status_callback("Creating compressed archive...")
+                status_callback("Creating compressed archive (this may take a while for large images)...")
             if progress_callback:
                 progress_callback(current_step, total_steps, "Compressing archive")
 
             os.makedirs(output_path, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            model = device_info.get("product", "pixel3")
+            model = device_codename or "pixel"
             archive_name = f"{model}_{timestamp}{ARCHIVE_EXTENSION}"
             archive_path = os.path.join(output_path, archive_name)
 
@@ -169,7 +208,7 @@ class ImagingEngine:
                 for partition in partitions:
                     img_file = f"{partition}{IMAGE_EXTENSION}"
                     img_full = os.path.join(temp_dir, img_file)
-                    if os.path.exists(img_full):
+                    if os.path.exists(img_full) and os.path.getsize(img_full) > 0:
                         zf.write(img_full, img_file)
 
             if status_callback:
