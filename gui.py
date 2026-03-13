@@ -137,8 +137,9 @@ class MainWindow(QMainWindow):
             ("📸  Create Image", 1),
             ("📋  Clone Device", 2),
             ("💾  Backup", 3),
-            ("📱  App Selector", 4),
-            ("📜  Log", 5),
+            ("♻️  Restore", 4),
+            ("📱  App Selector", 5),
+            ("📜  Log", 6),
         ]
         for label, idx in pages:
             btn = QPushButton(label)
@@ -163,6 +164,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._page_create_image())
         self.pages.addWidget(self._page_clone())
         self.pages.addWidget(self._page_backup())
+        self.pages.addWidget(self._page_restore())
         self.pages.addWidget(self._page_app_selector())
         self.pages.addWidget(self._page_log())
         body.addWidget(self.pages)
