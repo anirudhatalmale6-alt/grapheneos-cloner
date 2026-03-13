@@ -402,6 +402,19 @@ class FastbootWrapper:
                 info[var] = val
         return info
 
+    def wait_for_device(self, serial: str, timeout: int = 30) -> bool:
+        """Wait for a specific device to appear in fastboot mode."""
+        start = time.time()
+        while time.time() - start < timeout:
+            devices = self.list_devices()
+            for d in devices:
+                if d["serial"] == serial:
+                    return True
+            time.sleep(2)
+        # Also accept if ANY device is in fastboot (serial may change)
+        devices = self.list_devices()
+        return len(devices) > 0
+
     def flash_partition(self, serial: str, partition: str, image_path: str,
                         progress_callback: Optional[Callable] = None) -> bool:
         """Flash an image to a partition."""
