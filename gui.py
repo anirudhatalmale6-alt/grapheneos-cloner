@@ -498,9 +498,6 @@ class MainWindow(QMainWindow):
         self.download_progress.setVisible(False)
         factory_layout.addWidget(self.download_progress)
 
-        # Check if already downloaded
-        self._check_bundled_factory_image()
-
         # Manual file selection
         factory_file_layout = QHBoxLayout()
         self.factory_image_path = QLabel("No factory image selected")
@@ -515,6 +512,9 @@ class MainWindow(QMainWindow):
         self.btn_flash_factory.setObjectName("primaryBtn")
         self.btn_flash_factory.clicked.connect(self._start_flash_factory)
         factory_layout.addWidget(self.btn_flash_factory)
+
+        # Check if factory image already downloaded (must be after factory_image_path is created)
+        self._check_bundled_factory_image()
 
         layout.addWidget(grp_factory)
 

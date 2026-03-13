@@ -545,88 +545,61 @@ class ImagingEngine:
             with zipfile.ZipFile(factory_zip_path, "r") as zf:
                 zf.extractall(temp_dir)
 
-            # Find all .img files (they may be in a subdirectory)
-            img_files = []
+            # GrapheneOS factory image structure:
+            #   blueline-factory-2023020600/
+            #     bootloader-blueline-*.img
+            #     radio-blueline-*.img
+            #     image-blueline-2023020600.zip  (inner ZIP with system images)
+            #     flash-all.sh / flash-all.bat
+
+            # Find bootloader, radio, and inner image ZIP
+            bootloader_img = None
+            radio_img = None
+            inner_image_zip = None
+
             for root, dirs, files in os.walk(temp_dir):
                 for f in files:
-                    if f.endswith(".img"):
-                        img_files.append(os.path.join(root, f))
+                    full_path = os.path.join(root, f)
+                    if f.startswith("bootloader-") and f.endswith(".img"):
+                        bootloader_img = full_path
+                    elif f.startswith("radio-") and f.endswith(".img"):
+                        radio_img = full_path
+                    elif f.endswith(".zip") and "image" in f.lower():
+                        inner_image_zip = full_path
 
-            if not img_files:
-                result["message"] = "No .img files found in the ZIP. Make sure this is a valid GrapheneOS factory image."
-                if status_callback:
-                    status_callback(f"ERROR: {result['message']}")
-                return result
-
-            # Check for nested ZIP (GrapheneOS factory images contain an inner image ZIP)
-            inner_zips = []
-            for root, dirs, files in os.walk(temp_dir):
-                for f in files:
-                    if f.endswith(".zip") and "image" in f.lower():
-                        inner_zips.append(os.path.join(root, f))
-
-            if inner_zips:
-                if status_callback:
-                    status_callback("Found inner image archive, extracting...")
-                for iz in inner_zips:
-                    with zipfile.ZipFile(iz, "r") as zf:
-                        zf.extractall(temp_dir)
-                # Re-scan for img files
+            if not inner_image_zip:
+                # Fallback: maybe it's a flat ZIP with .img files directly
                 img_files = []
                 for root, dirs, files in os.walk(temp_dir):
                     for f in files:
-                        if f.endswith(".img"):
-                            img_files.append(os.path.join(root, f))
-
-            # Map partition names from filenames
-            # GrapheneOS factory images have files like:
-            #   bootloader-blueline-xxxx.img → partition "bootloader"
-            #   radio-blueline-xxxx.img → partition "radio"
-            #   boot.img, system.img, etc. → partition matches filename
-            partition_map = {}
-            bootloader_img = None
-            radio_img = None
-
-            for img_path in img_files:
-                fname = os.path.basename(img_path)
-                part_name = fname.replace(".img", "")
-
-                # Skip non-partition files
-                if part_name in ("android-info",):
-                    continue
-
-                # Detect bootloader/radio images (have device codename in name)
-                if part_name.startswith("bootloader-"):
-                    bootloader_img = img_path
-                    continue
-                elif part_name.startswith("radio-"):
-                    radio_img = img_path
-                    continue
-
-                partition_map[part_name] = img_path
+                        if f.endswith(".img") and not f.startswith("bootloader-") and not f.startswith("radio-"):
+                            img_files.append(f)
+                if not img_files:
+                    result["message"] = "No image files found in ZIP. Make sure this is a valid GrapheneOS factory image."
+                    if status_callback:
+                        status_callback(f"ERROR: {result['message']}")
+                    return result
 
             if status_callback:
-                parts_list = ", ".join(sorted(partition_map.keys()))
-                extra = []
+                found = []
                 if bootloader_img:
-                    extra.append("bootloader")
+                    found.append(f"bootloader ({os.path.basename(bootloader_img)})")
                 if radio_img:
-                    extra.append("radio")
-                if extra:
-                    parts_list = ", ".join(extra) + " + " + parts_list
-                status_callback(f"Found partitions to flash: {parts_list}")
+                    found.append(f"radio ({os.path.basename(radio_img)})")
+                if inner_image_zip:
+                    found.append(f"image archive ({os.path.basename(inner_image_zip)})")
+                status_callback(f"Found: {', '.join(found)}")
 
-            # Total steps: bootloader + reboot + radio + reboot + partitions + slot + reboot
-            total_steps = len(partition_map) + (1 if bootloader_img else 0) + (1 if radio_img else 0) + 3
+            total_steps = 5  # bootloader + reboot + radio + reboot + update
             current_step = 0
 
-            # Step 1: Flash bootloader first (required before other images)
+            # Step 1: Flash bootloader
             if bootloader_img:
                 self._check_cancel()
                 current_step += 1
                 if status_callback:
                     size_mb = os.path.getsize(bootloader_img) / 1048576
-                    status_callback(f"Flashing bootloader ({size_mb:.1f} MB)...")
+                    status_callback(f"Step 1/5: Flashing bootloader ({size_mb:.1f} MB)...")
                 if progress_callback:
                     progress_callback(current_step, total_steps, "Flashing bootloader")
 
@@ -634,22 +607,27 @@ class ImagingEngine:
                 if success:
                     result["flashed"].append("bootloader")
                     if status_callback:
-                        status_callback("  ✓ bootloader flashed — rebooting to bootloader...")
-                    # Must reboot to bootloader after flashing bootloader
-                    self.fastboot.reboot_to_bootloader(serial)
-                    time.sleep(5)  # Wait for device to come back
+                        status_callback("  ✓ bootloader flashed")
                 else:
                     result["failed"].append("bootloader")
                     if status_callback:
                         status_callback("  ✗ FAILED to flash bootloader")
+                    result["message"] = "Failed to flash bootloader"
+                    return result
 
-            # Step 2: Flash radio/modem firmware
+                # Reboot to bootloader (required after bootloader flash)
+                if status_callback:
+                    status_callback("  Rebooting to bootloader...")
+                self.fastboot.reboot_to_bootloader(serial)
+                time.sleep(8)  # Wait for device to come back
+
+            # Step 2: Flash radio/modem
             if radio_img:
                 self._check_cancel()
                 current_step += 1
                 if status_callback:
                     size_mb = os.path.getsize(radio_img) / 1048576
-                    status_callback(f"Flashing radio/modem ({size_mb:.1f} MB)...")
+                    status_callback(f"Step 2/5: Flashing radio ({size_mb:.1f} MB)...")
                 if progress_callback:
                     progress_callback(current_step, total_steps, "Flashing radio")
 
@@ -657,79 +635,98 @@ class ImagingEngine:
                 if success:
                     result["flashed"].append("radio")
                     if status_callback:
-                        status_callback("  ✓ radio flashed — rebooting to bootloader...")
-                    # Must reboot to bootloader after flashing radio
-                    self.fastboot.reboot_to_bootloader(serial)
-                    time.sleep(5)
+                        status_callback("  ✓ radio flashed")
                 else:
                     result["failed"].append("radio")
                     if status_callback:
                         status_callback("  ✗ FAILED to flash radio")
+                    result["message"] = "Failed to flash radio"
+                    return result
 
-            # Step 3: Flash all system partitions
-            for part_name, img_path in sorted(partition_map.items()):
-                self._check_cancel()
-                current_step += 1
-
+                # Reboot to bootloader (required after radio flash)
                 if status_callback:
-                    size_mb = os.path.getsize(img_path) / 1048576
-                    status_callback(f"Flashing {part_name} ({size_mb:.1f} MB)... ({current_step}/{total_steps})")
-                if progress_callback:
-                    progress_callback(current_step, total_steps, f"Flashing {part_name}")
+                    status_callback("  Rebooting to bootloader...")
+                self.fastboot.reboot_to_bootloader(serial)
+                time.sleep(8)
 
-                def _flash_progress(line, _p=part_name):
-                    if status_callback:
-                        status_callback(f"  {_p}: {line}")
+            # Step 3: Flash system images using 'fastboot update'
+            # This is the CORRECT way to flash A/B Pixel devices — it handles
+            # both slots, vbmeta, and all system partitions properly
+            self._check_cancel()
+            current_step = 4
+            if progress_callback:
+                progress_callback(current_step, total_steps, "Flashing system images")
 
-                success = self.fastboot.flash_partition(serial, part_name, img_path, _flash_progress)
-                if success:
-                    result["flashed"].append(part_name)
+            if inner_image_zip:
+                if status_callback:
+                    size_mb = os.path.getsize(inner_image_zip) / 1048576
+                    status_callback(f"Step 3/5: Flashing system images via 'fastboot update' ({size_mb:.0f} MB)...")
+                    status_callback("  This handles A/B slot flashing correctly. May take several minutes...")
+
+                def _update_progress(line):
                     if status_callback:
-                        status_callback(f"  ✓ {part_name} flashed successfully")
+                        status_callback(f"  {line}")
+
+                update_ok, update_output = self.fastboot.update(
+                    serial, inner_image_zip, wipe=True,
+                    progress_callback=_update_progress
+                )
+
+                if update_ok:
+                    result["flashed"].append("system (via fastboot update)")
+                    if status_callback:
+                        status_callback("  ✓ System images flashed successfully!")
                 else:
-                    result["failed"].append(part_name)
+                    result["failed"].append("system update")
+                    result["message"] = f"fastboot update failed:\n{update_output}"
                     if status_callback:
-                        status_callback(f"  ✗ FAILED to flash {part_name}")
-
-            if not result["flashed"]:
-                result["message"] = "ALL partitions failed to flash!"
+                        status_callback(f"  ✗ fastboot update FAILED: {update_output}")
+                    return result
+            else:
+                # Fallback: flash individual .img files (less reliable on A/B devices)
                 if status_callback:
-                    status_callback(f"ERROR: {result['message']}")
-                return result
+                    status_callback("No inner image ZIP found — falling back to individual partition flashing...")
+                    status_callback("WARNING: This is less reliable on A/B devices. Use official factory image if possible.")
 
-            # Set active slot
-            current_step += 1
-            if status_callback:
-                status_callback("Setting active slot to A...")
-            if progress_callback:
-                progress_callback(current_step, total_steps, "Setting slot")
-            self.fastboot.set_active_slot(serial, "a")
+                for root, dirs, files in os.walk(temp_dir):
+                    for f in sorted(files):
+                        if not f.endswith(".img"):
+                            continue
+                        if f.startswith("bootloader-") or f.startswith("radio-"):
+                            continue
+                        part_name = f.replace(".img", "")
+                        if part_name in ("android-info",):
+                            continue
+                        img_path = os.path.join(root, f)
+                        if status_callback:
+                            status_callback(f"  Flashing {part_name}...")
+                        ok = self.fastboot.flash_partition(serial, part_name, img_path)
+                        if ok:
+                            result["flashed"].append(part_name)
+                        else:
+                            result["failed"].append(part_name)
 
-            # Erase userdata for clean install
-            current_step += 1
-            if status_callback:
-                status_callback("Erasing userdata for clean install...")
-            if progress_callback:
-                progress_callback(current_step, total_steps, "Erasing userdata")
-            self.fastboot.erase_partition(serial, "userdata")
+                # Set active slot and wipe
+                self.fastboot.set_active_slot(serial, "a")
+                self.fastboot.erase_partition(serial, "userdata")
 
-            # Reboot
-            current_step += 1
-            if status_callback:
-                status_callback("Rebooting device...")
+            # Step 5: Done — device should reboot automatically after 'fastboot update'
+            current_step = 5
             if progress_callback:
-                progress_callback(current_step, total_steps, "Rebooting")
-            self.fastboot.reboot(serial)
+                progress_callback(current_step, total_steps, "Complete")
 
             if result["failed"]:
-                result["success"] = True
+                result["success"] = len(result["flashed"]) > 0
                 result["message"] = (
                     f"Partial: {len(result['flashed'])} flashed, "
                     f"{len(result['failed'])} failed ({', '.join(result['failed'])})"
                 )
             else:
                 result["success"] = True
-                result["message"] = f"All {len(result['flashed'])} partitions flashed! Device is rebooting into GrapheneOS."
+                result["message"] = (
+                    f"GrapheneOS flashed successfully! ({', '.join(result['flashed'])})\n"
+                    "Device should boot into GrapheneOS setup screen."
+                )
 
             if status_callback:
                 status_callback(result["message"])

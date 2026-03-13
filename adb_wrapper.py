@@ -452,3 +452,19 @@ class FastbootWrapper:
         """Flash a raw image without formatting."""
         rc, out, err = _run([self.fastboot, "-s", serial, "flash", partition, image_path], timeout=1800)
         return rc == 0
+
+    def update(self, serial: str, image_zip_path: str, wipe: bool = True,
+               progress_callback: Optional[Callable] = None) -> Tuple[bool, str]:
+        """Flash using 'fastboot update' which handles A/B slots correctly.
+        This is the proper way to flash factory images on A/B devices like Pixel.
+        Args:
+            serial: Device serial
+            image_zip_path: Path to the image ZIP (inner archive from factory image)
+            wipe: If True, adds -w flag to erase userdata
+        """
+        cmd = [self.fastboot, "-s", serial]
+        if wipe:
+            cmd.append("-w")
+        cmd.extend(["update", image_zip_path])
+        rc, output = _run_stream(cmd, progress_callback, timeout=1800)
+        return rc == 0, output

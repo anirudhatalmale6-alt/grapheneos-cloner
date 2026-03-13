@@ -5,7 +5,7 @@ import os
 import sys
 
 APP_NAME = "GrapheneOS Cloner"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.6.2"
 APP_AUTHOR = "GrapheneOS Cloner"
 
 # Bundled / downloadable factory images
