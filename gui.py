@@ -984,12 +984,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Targets", "No fastboot devices selected.")
             return
 
+        # Build device list string for confirmation
+        device_list_str = "\n".join(f"  • {s}" for s in targets)
         reply = QMessageBox.warning(
-            self, "Unlock Bootloader",
-            "WARNING: Unlocking the bootloader will ERASE ALL DATA on the device!\n\n"
-            "Make sure 'OEM unlocking' is enabled in Settings > Developer Options first.\n\n"
-            "You may need to confirm on the device screen (use Volume keys to select, Power to confirm).\n\n"
-            "Continue?",
+            self, "⚠️ UNLOCK BOOTLOADER — DATA WILL BE ERASED",
+            "⚠️⚠️⚠️ DANGER: THIS WILL ERASE ALL DATA ON THE DEVICE! ⚠️⚠️⚠️\n\n"
+            f"You are about to unlock the bootloader on:\n{device_list_str}\n\n"
+            "IMPORTANT: Make sure this is your TARGET phone, NOT your master phone!\n"
+            "Unlocking erases all apps, settings, and user data.\n\n"
+            "Prerequisites:\n"
+            "• 'OEM unlocking' must be enabled in Settings > Developer Options\n"
+            "• You may need to confirm on the device screen\n\n"
+            "Are you SURE this is the TARGET device (not your master)?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
 
@@ -1028,6 +1034,19 @@ class MainWindow(QMainWindow):
 
         if not targets:
             QMessageBox.warning(self, "No Targets", "No target devices selected.")
+            return
+
+        # Safety confirmation before flashing
+        device_list_str = "\n".join(f"  • {s}" for s in targets)
+        reply = QMessageBox.warning(
+            self, "Confirm Clone",
+            f"You are about to OVERWRITE the following device(s):\n{device_list_str}\n\n"
+            "This will replace the entire operating system and all data.\n"
+            "Make sure these are your TARGET phones, NOT your master!\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
             return
 
         self._log(f"Starting clone to {len(targets)} device(s)...")
