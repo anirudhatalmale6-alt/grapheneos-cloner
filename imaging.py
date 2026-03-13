@@ -270,6 +270,40 @@ class ImagingEngine:
                 status_callback(msg)
             return False, msg
 
+    def lock_bootloader(self, serial: str,
+                        status_callback: Optional[Callable] = None) -> tuple:
+        """
+        Lock the bootloader on a fastboot device.
+        NOTE: This will erase all data on the device!
+
+        Returns:
+            (success: bool, message: str)
+        """
+        if status_callback:
+            status_callback("Checking bootloader status...")
+
+        is_unlocked, msg = self.check_oem_unlocked(serial)
+        if not is_unlocked:
+            if status_callback:
+                status_callback("Bootloader is already locked!")
+            return True, "Already locked"
+
+        if status_callback:
+            status_callback("Locking bootloader...")
+            status_callback("NOTE: You may need to confirm on the device screen!")
+
+        success, output = self.fastboot.oem_lock(serial)
+
+        if success:
+            if status_callback:
+                status_callback("Bootloader locked successfully! Device will reboot.")
+            return True, "Bootloader locked"
+        else:
+            msg = "Failed to lock bootloader. "
+            if status_callback:
+                status_callback(msg + output)
+            return False, msg + output
+
     def restore_image(self, serial: str, archive_path: str,
                       partitions: Optional[List[str]] = None,
                       progress_callback: Optional[Callable] = None,

@@ -391,6 +391,11 @@ class FastbootWrapper:
         rc, out, err = _run([self.fastboot, "-s", serial, "flashing", "unlock"], timeout=60)
         return rc == 0, out + err
 
+    def oem_lock(self, serial: str) -> Tuple[bool, str]:
+        """Lock the bootloader (OEM lock)."""
+        rc, out, err = _run([self.fastboot, "-s", serial, "flashing", "lock"], timeout=60)
+        return rc == 0, out + err
+
     def fetch_partition(self, serial: str, partition: str, output_path: str,
                         progress_callback: Optional[Callable] = None) -> bool:
         """Fetch (dump) a partition image from device.

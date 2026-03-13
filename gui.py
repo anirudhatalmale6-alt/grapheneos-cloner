@@ -453,6 +453,10 @@ class MainWindow(QMainWindow):
         self.btn_unlock_bootloader.clicked.connect(self._unlock_bootloader)
         targets_btn_layout.addWidget(self.btn_unlock_bootloader)
 
+        self.btn_lock_bootloader = QPushButton("🔒 Lock Bootloader")
+        self.btn_lock_bootloader.clicked.connect(self._lock_bootloader)
+        targets_btn_layout.addWidget(self.btn_lock_bootloader)
+
         targets_btn_layout.addStretch()
         targets_layout.addLayout(targets_btn_layout)
 
@@ -1018,6 +1022,48 @@ class MainWindow(QMainWindow):
             else:
                 self.bootloader_status.setText(f"🔴 {serial}: {msg}")
                 self._log(f"Failed to unlock {serial}: {msg}")
+
+    def _lock_bootloader(self):
+        """Lock the bootloader on selected fastboot devices."""
+        targets = []
+        for i in range(self.clone_device_list.count()):
+            item = self.clone_device_list.item(i)
+            if item.checkState() == Qt.Checked:
+                targets.append(item.data(Qt.UserRole))
+
+        if not targets:
+            QMessageBox.warning(self, "No Targets", "No fastboot devices selected.")
+            return
+
+        device_list_str = "\n".join(f"  • {s}" for s in targets)
+        reply = QMessageBox.warning(
+            self, "Lock Bootloader",
+            f"You are about to LOCK the bootloader on:\n{device_list_str}\n\n"
+            "This secures the device and prevents further flashing.\n"
+            "Note: On some devices, locking may erase data.\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        for serial in targets:
+            self._log(f"Locking bootloader on {serial}...")
+            self.bootloader_status.setText(f"Locking {serial}... Check device screen for confirmation prompt!")
+            QApplication.processEvents()
+
+            success, msg = self.imaging.lock_bootloader(
+                serial,
+                status_callback=lambda s: self._log(s)
+            )
+
+            if success:
+                self.bootloader_status.setText(f"🟢 {serial}: Bootloader locked! Device is secured.")
+                self._log(f"Bootloader locked on {serial}")
+            else:
+                self.bootloader_status.setText(f"🔴 {serial}: {msg}")
+                self._log(f"Failed to lock {serial}: {msg}")
 
     def _start_clone(self):
         image_path = self.clone_image_path.text()
