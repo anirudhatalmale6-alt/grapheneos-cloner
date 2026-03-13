@@ -409,8 +409,8 @@ class MainWindow(QMainWindow):
         header.setObjectName("headerLabel")
         layout.addWidget(header)
 
-        desc = QLabel("Flash a previously captured image onto one or more target Pixel 3 devices. "
-                       "Target devices must be in fastboot mode with OEM unlocked.")
+        desc = QLabel("Flash a previously captured image onto one or more target Pixel devices.\n"
+                       "Target devices must be in fastboot mode with bootloader unlocked.")
         desc.setObjectName("statusLabel")
         desc.setWordWrap(True)
         layout.addWidget(desc)
@@ -439,10 +439,47 @@ class MainWindow(QMainWindow):
         self.clone_device_list.setMaximumHeight(150)
         targets_layout.addWidget(self.clone_device_list)
 
+        targets_btn_layout = QHBoxLayout()
         btn_refresh_targets = QPushButton("⟳ Refresh Devices")
         btn_refresh_targets.clicked.connect(self._poll_devices)
-        targets_layout.addWidget(btn_refresh_targets)
+        targets_btn_layout.addWidget(btn_refresh_targets)
+
+        self.btn_check_unlock = QPushButton("🔓 Check Bootloader Status")
+        self.btn_check_unlock.clicked.connect(self._check_bootloader_status)
+        targets_btn_layout.addWidget(self.btn_check_unlock)
+
+        self.btn_unlock_bootloader = QPushButton("🔑 Unlock Bootloader")
+        self.btn_unlock_bootloader.setObjectName("dangerBtn")
+        self.btn_unlock_bootloader.clicked.connect(self._unlock_bootloader)
+        targets_btn_layout.addWidget(self.btn_unlock_bootloader)
+
+        targets_btn_layout.addStretch()
+        targets_layout.addLayout(targets_btn_layout)
+
+        # Bootloader status label
+        self.bootloader_status = QLabel("")
+        self.bootloader_status.setObjectName("statusLabel")
+        self.bootloader_status.setWordWrap(True)
+        targets_layout.addWidget(self.bootloader_status)
+
         layout.addWidget(grp_targets)
+
+        # Pre-flash checklist
+        grp_checklist = QGroupBox("Pre-Flight Checklist")
+        checklist_layout = QVBoxLayout(grp_checklist)
+        checklist_items = [
+            "1. On the phone: Enable Developer Options (tap Build Number 7 times)",
+            "2. In Developer Options: Enable 'OEM unlocking'",
+            "3. Reboot phone to fastboot: hold Power + Volume Down",
+            "4. Click 'Unlock Bootloader' above (first time only)",
+            "5. Select your image file and click Clone",
+        ]
+        for item in checklist_items:
+            lbl = QLabel(item)
+            lbl.setObjectName("statusLabel")
+            lbl.setWordWrap(True)
+            checklist_layout.addWidget(lbl)
+        layout.addWidget(grp_checklist)
 
         # Progress
         self.clone_progress = QProgressBar()
@@ -451,6 +488,7 @@ class MainWindow(QMainWindow):
 
         self.clone_status = QLabel("")
         self.clone_status.setObjectName("statusLabel")
+        self.clone_status.setWordWrap(True)
         layout.addWidget(self.clone_status)
 
         # Action buttons
@@ -913,6 +951,68 @@ class MainWindow(QMainWindow):
             self.img_status.setText(f"❌ {message}")
             self._log(f"Image creation failed: {message}")
 
+    def _check_bootloader_status(self):
+        """Check bootloader lock status for all selected fastboot devices."""
+        targets = []
+        for i in range(self.clone_device_list.count()):
+            item = self.clone_device_list.item(i)
+            if item.checkState() == Qt.Checked:
+                targets.append(item.data(Qt.UserRole))
+
+        if not targets:
+            self.bootloader_status.setText("No devices selected. Connect a device in fastboot mode first.")
+            return
+
+        status_lines = []
+        for serial in targets:
+            is_unlocked, msg = self.imaging.check_oem_unlocked(serial)
+            icon = "🟢" if is_unlocked else "🔴"
+            status_lines.append(f"{icon} {serial}: {msg}")
+
+        self.bootloader_status.setText("\n".join(status_lines))
+        self._log("Bootloader check: " + " | ".join(status_lines))
+
+    def _unlock_bootloader(self):
+        """Attempt to unlock bootloader on selected fastboot devices."""
+        targets = []
+        for i in range(self.clone_device_list.count()):
+            item = self.clone_device_list.item(i)
+            if item.checkState() == Qt.Checked:
+                targets.append(item.data(Qt.UserRole))
+
+        if not targets:
+            QMessageBox.warning(self, "No Targets", "No fastboot devices selected.")
+            return
+
+        reply = QMessageBox.warning(
+            self, "Unlock Bootloader",
+            "WARNING: Unlocking the bootloader will ERASE ALL DATA on the device!\n\n"
+            "Make sure 'OEM unlocking' is enabled in Settings > Developer Options first.\n\n"
+            "You may need to confirm on the device screen (use Volume keys to select, Power to confirm).\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        for serial in targets:
+            self._log(f"Unlocking bootloader on {serial}...")
+            self.bootloader_status.setText(f"Unlocking {serial}... Check device screen for confirmation prompt!")
+            QApplication.processEvents()
+
+            success, msg = self.imaging.unlock_bootloader(
+                serial,
+                status_callback=lambda s: self._log(s)
+            )
+
+            if success:
+                self.bootloader_status.setText(f"🟢 {serial}: Bootloader unlocked! Device may reboot - put it back in fastboot mode.")
+                self._log(f"Bootloader unlocked on {serial}")
+            else:
+                self.bootloader_status.setText(f"🔴 {serial}: {msg}")
+                self._log(f"Failed to unlock {serial}: {msg}")
+
     def _start_clone(self):
         image_path = self.clone_image_path.text()
         if not os.path.isfile(image_path):
@@ -935,18 +1035,38 @@ class MainWindow(QMainWindow):
         self.clone_progress.setValue(0)
         self.btn_clone.setEnabled(False)
         self.btn_cancel_clone.setVisible(True)
+        self.clone_status.setText("Starting clone operation...")
 
         def do_work():
             results = []
             for serial in targets:
                 self._worker_status(f"Cloning to {serial}...", self.clone_status)
-                success = self.imaging.restore_image(
+                result = self.imaging.restore_image(
                     serial, image_path,
                     progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.clone_progress),
                     status_callback=lambda s: self._worker_status(s, self.clone_status),
                 )
-                results.append((serial, success))
-            return results
+                results.append((serial, result))
+
+            # Build summary
+            all_success = all(r["success"] for _, r in results)
+            any_success = any(r["success"] for _, r in results)
+
+            summary_lines = []
+            for serial, r in results:
+                if r["success"]:
+                    summary_lines.append(f"✓ {serial}: {r['message']}")
+                else:
+                    summary_lines.append(f"✗ {serial}: {r['message']}")
+
+            summary = "\n".join(summary_lines)
+
+            if all_success:
+                return {"overall": True, "summary": summary}
+            elif any_success:
+                return {"overall": True, "summary": "PARTIAL SUCCESS:\n" + summary}
+            else:
+                raise Exception("CLONE FAILED:\n" + summary)
 
         self._run_worker(do_work, self._on_clone_done)
 
@@ -954,12 +1074,26 @@ class MainWindow(QMainWindow):
         self.btn_clone.setEnabled(True)
         self.btn_cancel_clone.setVisible(False)
         if success:
-            self.clone_progress.setValue(100)
-            self.clone_status.setText("✅ Clone complete!")
-            self._log("Clone operation completed successfully")
+            # Parse the dict from the worker
+            try:
+                import ast
+                result = ast.literal_eval(message)
+                summary = result.get("summary", "Done")
+                if "PARTIAL" in summary:
+                    self.clone_progress.setValue(100)
+                    self.clone_status.setText(f"⚠️ {summary}")
+                    self._log(f"Clone partial: {summary}")
+                else:
+                    self.clone_progress.setValue(100)
+                    self.clone_status.setText(f"✅ Clone complete!\n{summary}")
+                    self._log(f"Clone success: {summary}")
+            except Exception:
+                self.clone_progress.setValue(100)
+                self.clone_status.setText(f"✅ Clone complete!")
+                self._log("Clone completed")
         else:
             self.clone_status.setText(f"❌ {message}")
-            self._log(f"Clone operation failed: {message}")
+            self._log(f"Clone failed: {message}")
 
     def _start_backup(self):
         idx = self.backup_device_combo.currentIndex()
@@ -1026,12 +1160,15 @@ class MainWindow(QMainWindow):
                     status_callback=lambda s: self._worker_status(s, self.restore_status),
                 )
             else:
-                # Full image restore
-                return self.imaging.restore_image(
+                # Full image restore - returns dict now
+                result = self.imaging.restore_image(
                     serial, file_path,
                     progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.restore_progress),
                     status_callback=lambda s: self._worker_status(s, self.restore_status),
                 )
+                if not result["success"]:
+                    raise Exception(result["message"])
+                return result["message"]
 
         self._run_worker(do_work, self._on_restore_done)
 
@@ -1040,8 +1177,8 @@ class MainWindow(QMainWindow):
         self.btn_cancel_restore.setVisible(False)
         if success:
             self.restore_progress.setValue(100)
-            self.restore_status.setText("✅ Restore complete!")
-            self._log("Restore completed successfully")
+            self.restore_status.setText(f"✅ Restore complete! {message}")
+            self._log(f"Restore completed: {message}")
         else:
             self.restore_status.setText(f"❌ {message}")
             self._log(f"Restore failed: {message}")

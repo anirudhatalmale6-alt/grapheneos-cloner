@@ -220,10 +220,60 @@ class ImagingEngine:
             # Cleanup temp directory
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def check_oem_unlocked(self, serial: str) -> tuple:
+        """
+        Check if a device in fastboot mode has its bootloader unlocked.
+
+        Returns:
+            (is_unlocked: bool, message: str)
+        """
+        unlocked = self.fastboot.get_var(serial, "unlocked")
+        if unlocked is None:
+            return False, "Could not read bootloader lock status"
+        if unlocked.lower() in ("yes", "true"):
+            return True, "Bootloader is unlocked"
+        return False, "Bootloader is LOCKED - flashing will fail"
+
+    def unlock_bootloader(self, serial: str,
+                          status_callback: Optional[Callable] = None) -> tuple:
+        """
+        Attempt to unlock the bootloader on a fastboot device.
+        NOTE: OEM unlocking must first be enabled in Settings > Developer Options.
+
+        Returns:
+            (success: bool, message: str)
+        """
+        if status_callback:
+            status_callback("Checking bootloader status...")
+
+        is_unlocked, msg = self.check_oem_unlocked(serial)
+        if is_unlocked:
+            if status_callback:
+                status_callback("Bootloader is already unlocked!")
+            return True, "Already unlocked"
+
+        if status_callback:
+            status_callback("Attempting to unlock bootloader...")
+            status_callback("NOTE: You may need to confirm on the device screen!")
+
+        success, output = self.fastboot.oem_unlock(serial)
+
+        if success:
+            if status_callback:
+                status_callback("Bootloader unlocked successfully! Device will reboot.")
+            return True, "Bootloader unlocked"
+        else:
+            msg = "Failed to unlock bootloader. "
+            if "FAIL" in output.upper():
+                msg += "Make sure OEM unlocking is enabled in Settings > Developer Options."
+            if status_callback:
+                status_callback(msg)
+            return False, msg
+
     def restore_image(self, serial: str, archive_path: str,
                       partitions: Optional[List[str]] = None,
                       progress_callback: Optional[Callable] = None,
-                      status_callback: Optional[Callable] = None) -> bool:
+                      status_callback: Optional[Callable] = None) -> dict:
         """
         Restore a device image to a connected device in fastboot mode.
 
@@ -235,12 +285,33 @@ class ImagingEngine:
             status_callback: Called with status message strings
 
         Returns:
-            True if successful
+            dict with keys: success (bool), flashed (list), failed (list), message (str)
         """
         self._cancel_flag = False
+        result = {"success": False, "flashed": [], "failed": [], "message": ""}
 
         if status_callback:
             status_callback("Preparing to restore image...")
+
+        # ── Step 1: Check bootloader unlock status ──
+        if status_callback:
+            status_callback("Checking bootloader status...")
+
+        is_unlocked, unlock_msg = self.check_oem_unlocked(serial)
+        if not is_unlocked:
+            result["message"] = (
+                "BOOTLOADER IS LOCKED! Flashing cannot proceed.\n"
+                "To unlock:\n"
+                "1. On the phone: Settings → System → Developer Options → Enable 'OEM unlocking'\n"
+                "2. In this app: Click 'Unlock Bootloader' button before cloning\n"
+                "Or run from command line: fastboot flashing unlock"
+            )
+            if status_callback:
+                status_callback(f"ERROR: {result['message']}")
+            return result
+
+        if status_callback:
+            status_callback("Bootloader is unlocked - proceeding with flash...")
 
         temp_dir = tempfile.mkdtemp(prefix="gcloner_restore_")
 
@@ -291,16 +362,33 @@ class ImagingEngine:
                 if progress_callback:
                     progress_callback(current_step, total_steps, f"Flashing {partition}")
 
-                def _flash_progress(line):
+                def _flash_progress(line, _p=partition):
                     if status_callback:
-                        status_callback(f"  {partition}: {line}")
+                        status_callback(f"  {_p}: {line}")
 
                 success = self.fastboot.flash_partition(serial, partition, img_path, _flash_progress)
-                if not success:
+                if success:
+                    result["flashed"].append(partition)
                     if status_callback:
-                        status_callback(f"WARNING: Failed to flash {partition}")
+                        status_callback(f"  ✓ {partition} flashed successfully")
+                else:
+                    result["failed"].append(partition)
+                    if status_callback:
+                        status_callback(f"  ✗ FAILED to flash {partition}")
+
+            # Check results
+            if not result["flashed"]:
+                result["message"] = (
+                    f"ALL {len(result['failed'])} partitions failed to flash! "
+                    "The device bootloader may still be locked, or the image is incompatible."
+                )
+                if status_callback:
+                    status_callback(f"ERROR: {result['message']}")
+                return result
 
             # Set active slot
+            if status_callback:
+                status_callback("Setting active slot...")
             self.fastboot.set_active_slot(serial, "a")
 
             # Reboot
@@ -312,10 +400,21 @@ class ImagingEngine:
 
             self.fastboot.reboot(serial)
 
-            if status_callback:
-                status_callback("Restore complete! Device is rebooting.")
+            # Build final message
+            if result["failed"]:
+                result["success"] = True  # Partial success
+                result["message"] = (
+                    f"Partial clone: {len(result['flashed'])} partitions flashed, "
+                    f"{len(result['failed'])} failed ({', '.join(result['failed'])})"
+                )
+            else:
+                result["success"] = True
+                result["message"] = f"All {len(result['flashed'])} partitions flashed successfully!"
 
-            return True
+            if status_callback:
+                status_callback(result["message"])
+
+            return result
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
