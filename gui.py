@@ -787,14 +787,15 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.Checked)
             self.clone_device_list.addItem(item)
 
-        # Restore device
-        self.restore_device_combo.clear()
-        for d in self.adb_devices:
-            label = f"{d.serial} ({d.model or 'ADB'})"
-            self.restore_device_combo.addItem(label, d.serial)
-        for d in self.fastboot_devices:
-            label = f"{d['serial']} (Fastboot)"
-            self.restore_device_combo.addItem(label, d['serial'])
+        # Restore device (only if restore page exists)
+        if hasattr(self, 'restore_device_combo'):
+            self.restore_device_combo.clear()
+            for d in self.adb_devices:
+                label = f"{d.serial} ({d.model or 'ADB'})"
+                self.restore_device_combo.addItem(label, d.serial)
+            for d in self.fastboot_devices:
+                label = f"{d['serial']} (Fastboot)"
+                self.restore_device_combo.addItem(label, d['serial'])
 
     def _update_dashboard_devices(self):
         """Update the dashboard devices list."""
