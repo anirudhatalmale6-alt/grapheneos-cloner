@@ -2,6 +2,7 @@
 GrapheneOS Cloner - Imaging Engine
 Handles creating, storing, and restoring full device images.
 Images are stored as compressed archives containing individual partition dumps.
+Also supports flashing official GrapheneOS factory images.
 """
 import os
 import json
@@ -9,6 +10,8 @@ import zipfile
 import shutil
 import tempfile
 import time
+import subprocess
+import glob as globmod
 from typing import Optional, List, Dict, Callable
 from dataclasses import dataclass, asdict
 
@@ -109,15 +112,29 @@ class ImagingEngine:
                         "2. Find 'Root access' or 'Enable root access via ADB'\n"
                         "3. Turn it ON\n"
                         "4. Reconnect USB and try again\n\n"
-                        "Note: You may need to install the 'userdebug' variant of GrapheneOS\n"
-                        "for root access support. The standard release does NOT support ADB root."
+                        "ALTERNATIVE: If root is not available, use 'Clone from Factory Image'\n"
+                        "on the Clone Device page instead. This downloads the official\n"
+                        "GrapheneOS image and flashes it to target devices."
                     )
                     if status_callback:
                         status_callback(f"ERROR: {error_msg}")
                     raise Exception(error_msg)
             else:
-                device_info = self.fastboot.get_device_info(serial)
-                device_codename = device_info.get("product", "").lower()
+                # Fastboot mode cannot read partitions on Pixel devices
+                error_msg = (
+                    "FASTBOOT MODE CANNOT READ PARTITIONS!\n\n"
+                    "Fastboot is designed for writing/flashing, not reading.\n"
+                    "The 'fastboot fetch' command is not supported on Pixel devices.\n\n"
+                    "OPTIONS:\n"
+                    "1. Switch to ADB mode: Boot the phone normally with USB debugging ON,\n"
+                    "   enable root access in Developer Options, then try again.\n\n"
+                    "2. Use 'Clone from Factory Image' on the Clone Device page:\n"
+                    "   This downloads the official GrapheneOS image and flashes it\n"
+                    "   to target devices — no root or image capture needed!"
+                )
+                if status_callback:
+                    status_callback(f"ERROR: {error_msg}")
+                raise Exception(error_msg)
 
             friendly_name = get_device_friendly_name(device_codename)
 
@@ -473,6 +490,167 @@ class ImagingEngine:
             else:
                 result["success"] = True
                 result["message"] = f"All {len(result['flashed'])} partitions flashed successfully!"
+
+            if status_callback:
+                status_callback(result["message"])
+
+            return result
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def flash_factory_image(self, serial: str, factory_zip_path: str,
+                            progress_callback: Optional[Callable] = None,
+                            status_callback: Optional[Callable] = None) -> dict:
+        """
+        Flash an official GrapheneOS factory image ZIP to a device in fastboot mode.
+        This is the recommended way to clone GrapheneOS — no root needed.
+
+        The factory image ZIP should contain .img files (boot.img, system.img, etc.)
+        and optionally a flash-all script.
+
+        Args:
+            serial: Device serial number (must be in fastboot mode)
+            factory_zip_path: Path to the factory image ZIP file
+            progress_callback: Called with (current_step, total_steps, message)
+            status_callback: Called with status message strings
+
+        Returns:
+            dict with keys: success (bool), flashed (list), failed (list), message (str)
+        """
+        self._cancel_flag = False
+        result = {"success": False, "flashed": [], "failed": [], "message": ""}
+
+        if status_callback:
+            status_callback("Preparing to flash factory image...")
+
+        # Check bootloader
+        is_unlocked, unlock_msg = self.check_oem_unlocked(serial)
+        if not is_unlocked:
+            result["message"] = (
+                "BOOTLOADER IS LOCKED! Flashing cannot proceed.\n"
+                "Click 'Unlock Bootloader' first."
+            )
+            if status_callback:
+                status_callback(f"ERROR: {result['message']}")
+            return result
+
+        temp_dir = tempfile.mkdtemp(prefix="gcloner_factory_")
+
+        try:
+            # Extract the factory ZIP
+            if status_callback:
+                status_callback("Extracting factory image...")
+
+            with zipfile.ZipFile(factory_zip_path, "r") as zf:
+                zf.extractall(temp_dir)
+
+            # Find all .img files (they may be in a subdirectory)
+            img_files = []
+            for root, dirs, files in os.walk(temp_dir):
+                for f in files:
+                    if f.endswith(".img"):
+                        img_files.append(os.path.join(root, f))
+
+            if not img_files:
+                result["message"] = "No .img files found in the ZIP. Make sure this is a valid GrapheneOS factory image."
+                if status_callback:
+                    status_callback(f"ERROR: {result['message']}")
+                return result
+
+            # Check for nested ZIP (GrapheneOS factory images contain an inner image ZIP)
+            inner_zips = []
+            for root, dirs, files in os.walk(temp_dir):
+                for f in files:
+                    if f.endswith(".zip") and "image" in f.lower():
+                        inner_zips.append(os.path.join(root, f))
+
+            if inner_zips:
+                if status_callback:
+                    status_callback("Found inner image archive, extracting...")
+                for iz in inner_zips:
+                    with zipfile.ZipFile(iz, "r") as zf:
+                        zf.extractall(temp_dir)
+                # Re-scan for img files
+                img_files = []
+                for root, dirs, files in os.walk(temp_dir):
+                    for f in files:
+                        if f.endswith(".img"):
+                            img_files.append(os.path.join(root, f))
+
+            # Map partition names from filenames
+            partition_map = {}
+            for img_path in img_files:
+                fname = os.path.basename(img_path)
+                part_name = fname.replace(".img", "")
+                # Skip android-info.txt artifacts
+                if part_name in ("android-info",):
+                    continue
+                partition_map[part_name] = img_path
+
+            if status_callback:
+                parts_list = ", ".join(sorted(partition_map.keys()))
+                status_callback(f"Found {len(partition_map)} partitions to flash: {parts_list}")
+
+            total_steps = len(partition_map) + 2  # partitions + slot + reboot
+            current_step = 0
+
+            # Flash each partition
+            for part_name, img_path in sorted(partition_map.items()):
+                self._check_cancel()
+                current_step += 1
+
+                if status_callback:
+                    size_mb = os.path.getsize(img_path) / 1048576
+                    status_callback(f"Flashing {part_name} ({size_mb:.1f} MB)... ({current_step}/{len(partition_map)})")
+                if progress_callback:
+                    progress_callback(current_step, total_steps, f"Flashing {part_name}")
+
+                def _flash_progress(line, _p=part_name):
+                    if status_callback:
+                        status_callback(f"  {_p}: {line}")
+
+                success = self.fastboot.flash_partition(serial, part_name, img_path, _flash_progress)
+                if success:
+                    result["flashed"].append(part_name)
+                    if status_callback:
+                        status_callback(f"  ✓ {part_name} flashed successfully")
+                else:
+                    result["failed"].append(part_name)
+                    if status_callback:
+                        status_callback(f"  ✗ FAILED to flash {part_name}")
+
+            if not result["flashed"]:
+                result["message"] = f"ALL partitions failed to flash!"
+                if status_callback:
+                    status_callback(f"ERROR: {result['message']}")
+                return result
+
+            # Set active slot
+            current_step += 1
+            if status_callback:
+                status_callback("Setting active slot...")
+            if progress_callback:
+                progress_callback(current_step, total_steps, "Setting slot")
+            self.fastboot.set_active_slot(serial, "a")
+
+            # Reboot
+            current_step += 1
+            if status_callback:
+                status_callback("Rebooting device...")
+            if progress_callback:
+                progress_callback(current_step, total_steps, "Rebooting")
+            self.fastboot.reboot(serial)
+
+            if result["failed"]:
+                result["success"] = True
+                result["message"] = (
+                    f"Partial: {len(result['flashed'])} flashed, "
+                    f"{len(result['failed'])} failed ({', '.join(result['failed'])})"
+                )
+            else:
+                result["success"] = True
+                result["message"] = f"All {len(result['flashed'])} partitions flashed! Device is rebooting."
 
             if status_callback:
                 status_callback(result["message"])

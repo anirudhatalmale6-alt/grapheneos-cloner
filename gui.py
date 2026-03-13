@@ -465,15 +465,47 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(grp_targets)
 
+        # Factory image section (recommended method)
+        grp_factory = QGroupBox("Option B: Flash Official GrapheneOS Image (Recommended — No Root Needed)")
+        factory_layout = QVBoxLayout(grp_factory)
+
+        factory_desc = QLabel(
+            "Download the official GrapheneOS factory image from grapheneos.org/releases\n"
+            "and select the ZIP file below. This flashes a clean GrapheneOS install\n"
+            "to target devices — no root access or image capture needed!")
+        factory_desc.setObjectName("statusLabel")
+        factory_desc.setWordWrap(True)
+        factory_layout.addWidget(factory_desc)
+
+        factory_file_layout = QHBoxLayout()
+        self.factory_image_path = QLabel("No factory image selected")
+        self.factory_image_path.setObjectName("statusLabel")
+        factory_file_layout.addWidget(self.factory_image_path)
+        btn_select_factory = QPushButton("Select Factory ZIP...")
+        btn_select_factory.clicked.connect(self._browse_factory_image)
+        factory_file_layout.addWidget(btn_select_factory)
+        factory_layout.addLayout(factory_file_layout)
+
+        self.btn_flash_factory = QPushButton("⚡  Flash Factory Image to Selected Devices")
+        self.btn_flash_factory.setObjectName("primaryBtn")
+        self.btn_flash_factory.clicked.connect(self._start_flash_factory)
+        factory_layout.addWidget(self.btn_flash_factory)
+
+        layout.addWidget(grp_factory)
+
+        # Re-label the existing image section as Option A
+        grp_img.setTitle("Option A: Clone from Captured Image (Requires Root on Master)")
+
         # Pre-flash checklist
         grp_checklist = QGroupBox("Pre-Flight Checklist")
         checklist_layout = QVBoxLayout(grp_checklist)
         checklist_items = [
-            "1. On the phone: Enable Developer Options (tap Build Number 7 times)",
+            "1. On TARGET phone: Enable Developer Options (tap Build Number 7 times)",
             "2. In Developer Options: Enable 'OEM unlocking'",
-            "3. Reboot phone to fastboot: hold Power + Volume Down",
+            "3. Reboot TARGET phone to fastboot: hold Power + Volume Down",
             "4. Click 'Unlock Bootloader' above (first time only)",
-            "5. Select your image file and click Clone",
+            "5. Either: Select a captured .gimg image (Option A) or a factory ZIP (Option B)",
+            "6. Click Clone / Flash",
         ]
         for item in checklist_items:
             lbl = QLabel(item)
@@ -1020,6 +1052,107 @@ class MainWindow(QMainWindow):
             else:
                 self.bootloader_status.setText(f"🔴 {serial}: {msg}")
                 self._log(f"Failed to unlock {serial}: {msg}")
+
+    def _browse_factory_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select GrapheneOS Factory Image", "",
+            "ZIP Files (*.zip);;All Files (*.*)"
+        )
+        if path:
+            self.factory_image_path.setText(path)
+            self._log(f"Factory image selected: {path}")
+
+    def _start_flash_factory(self):
+        factory_path = self.factory_image_path.text()
+        if not os.path.isfile(factory_path):
+            QMessageBox.warning(self, "No File", "Select a GrapheneOS factory image ZIP first.")
+            return
+
+        targets = []
+        for i in range(self.clone_device_list.count()):
+            item = self.clone_device_list.item(i)
+            if item.checkState() == Qt.Checked:
+                targets.append(item.data(Qt.UserRole))
+
+        if not targets:
+            QMessageBox.warning(self, "No Targets", "No target devices selected.")
+            return
+
+        device_list_str = "\n".join(f"  • {s}" for s in targets)
+        reply = QMessageBox.warning(
+            self, "Confirm Factory Flash",
+            f"You are about to flash GrapheneOS factory image onto:\n{device_list_str}\n\n"
+            "This will install a FRESH copy of GrapheneOS.\n"
+            "All existing data on these devices will be replaced.\n\n"
+            "Make sure these are your TARGET phones, NOT your master!\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._log(f"Starting factory flash to {len(targets)} device(s)...")
+        self.clone_progress.setVisible(True)
+        self.clone_progress.setValue(0)
+        self.btn_flash_factory.setEnabled(False)
+        self.btn_clone.setEnabled(False)
+        self.btn_cancel_clone.setVisible(True)
+        self.clone_status.setText("Starting factory image flash...")
+
+        def do_work():
+            results = []
+            for serial in targets:
+                self._worker_status(f"Flashing factory image to {serial}...", self.clone_status)
+                result = self.imaging.flash_factory_image(
+                    serial, factory_path,
+                    progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.clone_progress),
+                    status_callback=lambda s: self._worker_status(s, self.clone_status),
+                )
+                results.append((serial, result))
+
+            all_success = all(r["success"] for _, r in results)
+            any_success = any(r["success"] for _, r in results)
+
+            summary_lines = []
+            for serial, r in results:
+                if r["success"]:
+                    summary_lines.append(f"✓ {serial}: {r['message']}")
+                else:
+                    summary_lines.append(f"✗ {serial}: {r['message']}")
+
+            summary = "\n".join(summary_lines)
+
+            if all_success:
+                return {"overall": True, "summary": summary}
+            elif any_success:
+                return {"overall": True, "summary": "PARTIAL SUCCESS:\n" + summary}
+            else:
+                raise Exception("FLASH FAILED:\n" + summary)
+
+        self._run_worker(do_work, self._on_factory_flash_done)
+
+    def _on_factory_flash_done(self, success, message):
+        self.btn_flash_factory.setEnabled(True)
+        self.btn_clone.setEnabled(True)
+        self.btn_cancel_clone.setVisible(False)
+        if success:
+            try:
+                import ast
+                result = ast.literal_eval(message)
+                summary = result.get("summary", "Done")
+                self.clone_progress.setValue(100)
+                if "PARTIAL" in summary:
+                    self.clone_status.setText(f"⚠️ {summary}")
+                else:
+                    self.clone_status.setText(f"✅ Factory flash complete!\n{summary}")
+                self._log(f"Factory flash: {summary}")
+            except Exception:
+                self.clone_progress.setValue(100)
+                self.clone_status.setText("✅ Factory flash complete!")
+                self._log("Factory flash completed")
+        else:
+            self.clone_status.setText(f"❌ {message}")
+            self._log(f"Factory flash failed: {message}")
 
     def _lock_bootloader(self):
         """Lock the bootloader on selected fastboot devices."""
