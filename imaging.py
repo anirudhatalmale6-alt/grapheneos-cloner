@@ -579,30 +579,101 @@ class ImagingEngine:
                             img_files.append(os.path.join(root, f))
 
             # Map partition names from filenames
+            # GrapheneOS factory images have files like:
+            #   bootloader-blueline-xxxx.img → partition "bootloader"
+            #   radio-blueline-xxxx.img → partition "radio"
+            #   boot.img, system.img, etc. → partition matches filename
             partition_map = {}
+            bootloader_img = None
+            radio_img = None
+
             for img_path in img_files:
                 fname = os.path.basename(img_path)
                 part_name = fname.replace(".img", "")
-                # Skip android-info.txt artifacts
+
+                # Skip non-partition files
                 if part_name in ("android-info",):
                     continue
+
+                # Detect bootloader/radio images (have device codename in name)
+                if part_name.startswith("bootloader-"):
+                    bootloader_img = img_path
+                    continue
+                elif part_name.startswith("radio-"):
+                    radio_img = img_path
+                    continue
+
                 partition_map[part_name] = img_path
 
             if status_callback:
                 parts_list = ", ".join(sorted(partition_map.keys()))
-                status_callback(f"Found {len(partition_map)} partitions to flash: {parts_list}")
+                extra = []
+                if bootloader_img:
+                    extra.append("bootloader")
+                if radio_img:
+                    extra.append("radio")
+                if extra:
+                    parts_list = ", ".join(extra) + " + " + parts_list
+                status_callback(f"Found partitions to flash: {parts_list}")
 
-            total_steps = len(partition_map) + 2  # partitions + slot + reboot
+            # Total steps: bootloader + reboot + radio + reboot + partitions + slot + reboot
+            total_steps = len(partition_map) + (1 if bootloader_img else 0) + (1 if radio_img else 0) + 3
             current_step = 0
 
-            # Flash each partition
+            # Step 1: Flash bootloader first (required before other images)
+            if bootloader_img:
+                self._check_cancel()
+                current_step += 1
+                if status_callback:
+                    size_mb = os.path.getsize(bootloader_img) / 1048576
+                    status_callback(f"Flashing bootloader ({size_mb:.1f} MB)...")
+                if progress_callback:
+                    progress_callback(current_step, total_steps, "Flashing bootloader")
+
+                success = self.fastboot.flash_partition(serial, "bootloader", bootloader_img)
+                if success:
+                    result["flashed"].append("bootloader")
+                    if status_callback:
+                        status_callback("  ✓ bootloader flashed — rebooting to bootloader...")
+                    # Must reboot to bootloader after flashing bootloader
+                    self.fastboot.reboot_to_bootloader(serial)
+                    time.sleep(5)  # Wait for device to come back
+                else:
+                    result["failed"].append("bootloader")
+                    if status_callback:
+                        status_callback("  ✗ FAILED to flash bootloader")
+
+            # Step 2: Flash radio/modem firmware
+            if radio_img:
+                self._check_cancel()
+                current_step += 1
+                if status_callback:
+                    size_mb = os.path.getsize(radio_img) / 1048576
+                    status_callback(f"Flashing radio/modem ({size_mb:.1f} MB)...")
+                if progress_callback:
+                    progress_callback(current_step, total_steps, "Flashing radio")
+
+                success = self.fastboot.flash_partition(serial, "radio", radio_img)
+                if success:
+                    result["flashed"].append("radio")
+                    if status_callback:
+                        status_callback("  ✓ radio flashed — rebooting to bootloader...")
+                    # Must reboot to bootloader after flashing radio
+                    self.fastboot.reboot_to_bootloader(serial)
+                    time.sleep(5)
+                else:
+                    result["failed"].append("radio")
+                    if status_callback:
+                        status_callback("  ✗ FAILED to flash radio")
+
+            # Step 3: Flash all system partitions
             for part_name, img_path in sorted(partition_map.items()):
                 self._check_cancel()
                 current_step += 1
 
                 if status_callback:
                     size_mb = os.path.getsize(img_path) / 1048576
-                    status_callback(f"Flashing {part_name} ({size_mb:.1f} MB)... ({current_step}/{len(partition_map)})")
+                    status_callback(f"Flashing {part_name} ({size_mb:.1f} MB)... ({current_step}/{total_steps})")
                 if progress_callback:
                     progress_callback(current_step, total_steps, f"Flashing {part_name}")
 
@@ -621,7 +692,7 @@ class ImagingEngine:
                         status_callback(f"  ✗ FAILED to flash {part_name}")
 
             if not result["flashed"]:
-                result["message"] = f"ALL partitions failed to flash!"
+                result["message"] = "ALL partitions failed to flash!"
                 if status_callback:
                     status_callback(f"ERROR: {result['message']}")
                 return result
@@ -629,10 +700,18 @@ class ImagingEngine:
             # Set active slot
             current_step += 1
             if status_callback:
-                status_callback("Setting active slot...")
+                status_callback("Setting active slot to A...")
             if progress_callback:
                 progress_callback(current_step, total_steps, "Setting slot")
             self.fastboot.set_active_slot(serial, "a")
+
+            # Erase userdata for clean install
+            current_step += 1
+            if status_callback:
+                status_callback("Erasing userdata for clean install...")
+            if progress_callback:
+                progress_callback(current_step, total_steps, "Erasing userdata")
+            self.fastboot.erase_partition(serial, "userdata")
 
             # Reboot
             current_step += 1
@@ -650,7 +729,7 @@ class ImagingEngine:
                 )
             else:
                 result["success"] = True
-                result["message"] = f"All {len(result['flashed'])} partitions flashed! Device is rebooting."
+                result["message"] = f"All {len(result['flashed'])} partitions flashed! Device is rebooting into GrapheneOS."
 
             if status_callback:
                 status_callback(result["message"])

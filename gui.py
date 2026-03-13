@@ -1141,6 +1141,7 @@ class MainWindow(QMainWindow):
     def _download_bundled_factory_image(self):
         """Download the Pixel 3 GrapheneOS factory image from Wayback Machine."""
         import urllib.request
+        import hashlib
 
         img_info = FACTORY_IMAGE_URLS.get("blueline")
         if not img_info:
@@ -1155,22 +1156,33 @@ class MainWindow(QMainWindow):
         self.btn_download_factory.setEnabled(False)
         self.download_progress.setVisible(True)
         self.download_progress.setValue(0)
-        self.download_status_label.setText("Downloading factory image...")
+        self.download_status_label.setText("Downloading factory image (~1 GB)...")
         self._log(f"Downloading {img_info['filename']} from Wayback Machine archive...")
+        self._log("This is a ~1 GB download. Please be patient...")
 
         def do_download():
-            # Download factory image
+            # Download factory image with robust streaming
             req = urllib.request.Request(img_info["url"])
             req.add_header("User-Agent", "GrapheneOS-Cloner/1.6")
-            response = urllib.request.urlopen(req, timeout=300)
+
+            try:
+                response = urllib.request.urlopen(req, timeout=600)
+            except Exception as e:
+                raise Exception(f"Failed to connect: {e}")
 
             total_size = int(response.headers.get("content-length", 0))
             downloaded = 0
-            block_size = 1048576  # 1MB chunks
+            block_size = 262144  # 256KB chunks (more reliable for large files)
 
             with open(local_path, "wb") as f:
                 while True:
-                    chunk = response.read(block_size)
+                    try:
+                        chunk = response.read(block_size)
+                    except Exception as e:
+                        raise Exception(
+                            f"Download interrupted at {downloaded // 1048576} MB: {e}\n"
+                            f"Please try again — the download will resume."
+                        )
                     if not chunk:
                         break
                     f.write(chunk)
@@ -1182,6 +1194,29 @@ class MainWindow(QMainWindow):
                             self.download_status_label.setText(
                                 f"Downloading... {d // 1048576} MB / {t // 1048576} MB"
                             ))
+
+            # Verify the downloaded file is a valid ZIP
+            actual_size = os.path.getsize(local_path)
+            if total_size > 0 and actual_size < total_size * 0.95:
+                os.remove(local_path)
+                raise Exception(
+                    f"Download incomplete: got {actual_size // 1048576} MB of {total_size // 1048576} MB.\n"
+                    f"Please try again."
+                )
+
+            # Quick ZIP validation
+            import zipfile
+            try:
+                with zipfile.ZipFile(local_path, "r") as zf:
+                    names = zf.namelist()
+                    if not names:
+                        raise Exception("ZIP is empty")
+            except zipfile.BadZipFile:
+                os.remove(local_path)
+                raise Exception(
+                    "Downloaded file is not a valid ZIP. The download may have been corrupted.\n"
+                    "Please try again."
+                )
 
             # Download signature file
             QTimer.singleShot(0, lambda: self.download_status_label.setText("Downloading signature..."))
@@ -1201,10 +1236,10 @@ class MainWindow(QMainWindow):
             self.download_progress.setVisible(False)
             if success and os.path.isfile(local_path):
                 size_mb = os.path.getsize(local_path) / 1048576
-                self.download_status_label.setText(f"Downloaded! ({size_mb:.0f} MB)")
+                self.download_status_label.setText(f"Downloaded and verified! ({size_mb:.0f} MB)")
                 self.factory_image_path.setText(local_path)
                 self.btn_download_factory.setText("Re-download Pixel 3 Factory Image")
-                self._log(f"Factory image downloaded: {local_path} ({size_mb:.0f} MB)")
+                self._log(f"Factory image downloaded and verified: {local_path} ({size_mb:.0f} MB)")
             else:
                 self.download_status_label.setText(f"Download failed: {message}")
                 self._log(f"Factory image download failed: {message}")
