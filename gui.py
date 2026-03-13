@@ -22,6 +22,7 @@ from PyQt5.QtGui import QFont, QIcon, QColor, QPalette
 from config import (
     APP_NAME, APP_VERSION, PIXEL3_PARTITIONS,
     get_default_image_dir, get_default_backup_dir,
+    get_factory_images_dir, FACTORY_IMAGE_URLS,
 )
 from adb_wrapper import ADBWrapper, FastbootWrapper, ADBDevice
 from imaging import ImagingEngine, OperationCancelled
@@ -472,13 +473,35 @@ class MainWindow(QMainWindow):
         factory_layout = QVBoxLayout(grp_factory)
 
         factory_desc = QLabel(
-            "Download the official GrapheneOS factory image from grapheneos.org/releases\n"
-            "and select the ZIP file below. This flashes a clean GrapheneOS install\n"
-            "to target devices — no root access or image capture needed!")
+            "Flash an official GrapheneOS factory image to target devices.\n"
+            "No root access or image capture needed! For Pixel 3, use the built-in download\n"
+            "since GrapheneOS discontinued official Pixel 3 images.")
         factory_desc.setObjectName("statusLabel")
         factory_desc.setWordWrap(True)
         factory_layout.addWidget(factory_desc)
 
+        # Built-in download section
+        download_layout = QHBoxLayout()
+        self.btn_download_factory = QPushButton("Download Pixel 3 Factory Image (built-in)")
+        self.btn_download_factory.setObjectName("primaryBtn")
+        self.btn_download_factory.clicked.connect(self._download_bundled_factory_image)
+        download_layout.addWidget(self.btn_download_factory)
+
+        self.download_status_label = QLabel("")
+        self.download_status_label.setObjectName("statusLabel")
+        download_layout.addWidget(self.download_status_label)
+        download_layout.addStretch()
+        factory_layout.addLayout(download_layout)
+
+        # Download progress bar
+        self.download_progress = QProgressBar()
+        self.download_progress.setVisible(False)
+        factory_layout.addWidget(self.download_progress)
+
+        # Check if already downloaded
+        self._check_bundled_factory_image()
+
+        # Manual file selection
         factory_file_layout = QHBoxLayout()
         self.factory_image_path = QLabel("No factory image selected")
         self.factory_image_path.setObjectName("statusLabel")
@@ -488,7 +511,7 @@ class MainWindow(QMainWindow):
         factory_file_layout.addWidget(btn_select_factory)
         factory_layout.addLayout(factory_file_layout)
 
-        self.btn_flash_factory = QPushButton("⚡  Flash Factory Image to Selected Devices")
+        self.btn_flash_factory = QPushButton("Flash Factory Image to Selected Devices")
         self.btn_flash_factory.setObjectName("primaryBtn")
         self.btn_flash_factory.clicked.connect(self._start_flash_factory)
         factory_layout.addWidget(self.btn_flash_factory)
@@ -583,6 +606,31 @@ class MainWindow(QMainWindow):
         btn_browse.clicked.connect(self._browse_backup_output)
         out_layout.addWidget(btn_browse)
         layout.addWidget(grp_out)
+
+        # User profiles section
+        grp_users = QGroupBox("User Profiles")
+        users_layout = QVBoxLayout(grp_users)
+
+        users_desc = QLabel(
+            "The tool will automatically detect ALL user profiles on the device and\n"
+            "backup apps from each profile. Apps are shared but tracked per-user.")
+        users_desc.setObjectName("statusLabel")
+        users_desc.setWordWrap(True)
+        users_layout.addWidget(users_desc)
+
+        users_btn_layout = QHBoxLayout()
+        btn_detect_users = QPushButton("Detect User Profiles")
+        btn_detect_users.clicked.connect(self._detect_user_profiles)
+        users_btn_layout.addWidget(btn_detect_users)
+        users_btn_layout.addStretch()
+        users_layout.addLayout(users_btn_layout)
+
+        self.user_profiles_label = QLabel("Click 'Detect User Profiles' to scan device")
+        self.user_profiles_label.setObjectName("statusLabel")
+        self.user_profiles_label.setWordWrap(True)
+        users_layout.addWidget(self.user_profiles_label)
+
+        layout.addWidget(grp_users)
 
         # Options
         self.backup_include_apps = QCheckBox("Include user-installed apps (APKs)")
@@ -1055,9 +1103,117 @@ class MainWindow(QMainWindow):
                 self.bootloader_status.setText(f"🔴 {serial}: {msg}")
                 self._log(f"Failed to unlock {serial}: {msg}")
 
+    def _detect_user_profiles(self):
+        """Detect user profiles on the connected device."""
+        if not self.adb_devices:
+            self.user_profiles_label.setText("No ADB device connected. Connect a device first.")
+            return
+        serial = self.adb_devices[0].serial
+        self._log(f"Detecting user profiles on {serial}...")
+        users = self.adb.list_users(serial)
+
+        lines = []
+        for u in users:
+            uid = int(u['id'])
+            pkgs = self.adb.get_user_packages(serial, user_id=uid)
+            lines.append(f"User {u['id']} ({u['name']}): {len(pkgs)} apps")
+            self._log(f"  User {u['id']} ({u['name']}): {len(pkgs)} user-installed apps")
+
+        self.user_profiles_label.setText(
+            f"Found {len(users)} user profile(s):\n" + "\n".join(lines) +
+            "\n\nAll profiles will be backed up automatically."
+        )
+        self._log(f"Detected {len(users)} user profile(s)")
+
+    def _check_bundled_factory_image(self):
+        """Check if the Pixel 3 factory image is already downloaded."""
+        factory_dir = get_factory_images_dir()
+        img_info = FACTORY_IMAGE_URLS.get("blueline", {})
+        if not img_info:
+            return
+        local_path = os.path.join(factory_dir, img_info["filename"])
+        if os.path.isfile(local_path):
+            size_mb = os.path.getsize(local_path) / 1048576
+            self.download_status_label.setText(f"Already downloaded ({size_mb:.0f} MB)")
+            self.factory_image_path.setText(local_path)
+            self.btn_download_factory.setText("Re-download Pixel 3 Factory Image")
+
+    def _download_bundled_factory_image(self):
+        """Download the Pixel 3 GrapheneOS factory image from Wayback Machine."""
+        import urllib.request
+
+        img_info = FACTORY_IMAGE_URLS.get("blueline")
+        if not img_info:
+            QMessageBox.warning(self, "Error", "No factory image URL configured for Pixel 3.")
+            return
+
+        factory_dir = get_factory_images_dir()
+        os.makedirs(factory_dir, exist_ok=True)
+        local_path = os.path.join(factory_dir, img_info["filename"])
+        local_sig = os.path.join(factory_dir, img_info["sig_filename"])
+
+        self.btn_download_factory.setEnabled(False)
+        self.download_progress.setVisible(True)
+        self.download_progress.setValue(0)
+        self.download_status_label.setText("Downloading factory image...")
+        self._log(f"Downloading {img_info['filename']} from Wayback Machine archive...")
+
+        def do_download():
+            # Download factory image
+            req = urllib.request.Request(img_info["url"])
+            req.add_header("User-Agent", "GrapheneOS-Cloner/1.6")
+            response = urllib.request.urlopen(req, timeout=300)
+
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
+            block_size = 1048576  # 1MB chunks
+
+            with open(local_path, "wb") as f:
+                while True:
+                    chunk = response.read(block_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = int(downloaded * 100 / total_size)
+                        QTimer.singleShot(0, lambda p=pct: self.download_progress.setValue(p))
+                        QTimer.singleShot(0, lambda d=downloaded, t=total_size:
+                            self.download_status_label.setText(
+                                f"Downloading... {d // 1048576} MB / {t // 1048576} MB"
+                            ))
+
+            # Download signature file
+            QTimer.singleShot(0, lambda: self.download_status_label.setText("Downloading signature..."))
+            try:
+                sig_req = urllib.request.Request(img_info["sig_url"])
+                sig_req.add_header("User-Agent", "GrapheneOS-Cloner/1.6")
+                sig_resp = urllib.request.urlopen(sig_req, timeout=60)
+                with open(local_sig, "wb") as f:
+                    f.write(sig_resp.read())
+            except Exception:
+                pass  # Signature is optional
+
+            return local_path
+
+        def on_done(success, message):
+            self.btn_download_factory.setEnabled(True)
+            self.download_progress.setVisible(False)
+            if success and os.path.isfile(local_path):
+                size_mb = os.path.getsize(local_path) / 1048576
+                self.download_status_label.setText(f"Downloaded! ({size_mb:.0f} MB)")
+                self.factory_image_path.setText(local_path)
+                self.btn_download_factory.setText("Re-download Pixel 3 Factory Image")
+                self._log(f"Factory image downloaded: {local_path} ({size_mb:.0f} MB)")
+            else:
+                self.download_status_label.setText(f"Download failed: {message}")
+                self._log(f"Factory image download failed: {message}")
+
+        self._run_worker(do_download, on_done)
+
     def _browse_factory_image(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select GrapheneOS Factory Image", "",
+            self, "Select GrapheneOS Factory Image", get_factory_images_dir(),
             "ZIP Files (*.zip);;All Files (*.*)"
         )
         if path:
@@ -1303,7 +1459,8 @@ class MainWindow(QMainWindow):
         output = self.backup_output_path.text()
         include_apps = self.backup_include_apps.isChecked()
 
-        self._log(f"Starting backup of {serial}...")
+        self._log(f"Starting multi-user backup of {serial}...")
+        self._log("All user profiles will be scanned and backed up automatically.")
         self.backup_progress.setVisible(True)
         self.backup_progress.setValue(0)
         self.btn_backup.setEnabled(False)
@@ -1312,6 +1469,7 @@ class MainWindow(QMainWindow):
         def do_work():
             return self.imaging.create_backup(
                 serial, output, include_apps,
+                user_ids=None,  # None = all user profiles
                 progress_callback=lambda c, t, m: self._worker_progress(c, t, m, self.backup_progress),
                 status_callback=lambda s: self._worker_status(s, self.backup_status),
             )

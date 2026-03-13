@@ -5,8 +5,20 @@ import os
 import sys
 
 APP_NAME = "GrapheneOS Cloner"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.6.0"
 APP_AUTHOR = "GrapheneOS Cloner"
+
+# Bundled / downloadable factory images
+# Pixel 3 (blueline) — last GrapheneOS build (Feb 2023, discontinued)
+FACTORY_IMAGE_URLS = {
+    "blueline": {
+        "name": "Pixel 3 (blueline) — GrapheneOS 2023020600",
+        "url": "https://web.archive.org/web/20230418211733/https://releases.grapheneos.org/blueline-factory-2023020600.zip",
+        "sig_url": "https://web.archive.org/web/20230418203501/https://releases.grapheneos.org/blueline-factory-2023020600.zip.sig",
+        "filename": "blueline-factory-2023020600.zip",
+        "sig_filename": "blueline-factory-2023020600.zip.sig",
+    },
+}
 
 # Supported Pixel devices and their partition layouts
 # GrapheneOS supports: Pixel 3/3a/4/4a/5/5a/6/6a/6 Pro/7/7a/7 Pro/8/8a/8 Pro/9/9 Pro
@@ -128,3 +140,8 @@ def get_default_image_dir():
 
 def get_default_backup_dir():
     return os.path.join(os.path.expanduser("~"), "GrapheneOS_Cloner", "backups")
+
+
+def get_factory_images_dir():
+    """Directory where downloaded factory images are stored."""
+    return os.path.join(os.path.expanduser("~"), "GrapheneOS_Cloner", "factory_images")

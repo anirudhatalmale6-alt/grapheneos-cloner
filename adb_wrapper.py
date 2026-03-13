@@ -156,9 +156,12 @@ class ADBWrapper:
                     packages.append(match.group(2))
         return sorted(packages)
 
-    def get_user_packages(self, serial: str) -> List[str]:
-        """Get list of user-installed packages only (third-party)."""
-        rc, out, err = _run([self.adb, "-s", serial, "shell", "pm", "list", "packages", "-3"])
+    def get_user_packages(self, serial: str, user_id: int = 0) -> List[str]:
+        """Get list of user-installed packages only (third-party).
+        Optionally specify a user_id for multi-user devices."""
+        cmd = [self.adb, "-s", serial, "shell", "pm", "list", "packages",
+               "--user", str(user_id), "-3"]
+        rc, out, err = _run(cmd)
         if rc != 0:
             return []
         packages = []
@@ -168,6 +171,33 @@ class ADBWrapper:
                 pkg = line.replace("package:", "").strip()
                 packages.append(pkg)
         return sorted(packages)
+
+    def list_users(self, serial: str) -> List[Dict[str, str]]:
+        """List all user profiles on the device.
+        Returns list of dicts with 'id' and 'name' keys."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell", "pm", "list", "users"])
+        if rc != 0:
+            return [{"id": "0", "name": "Owner"}]
+        users = []
+        for line in out.strip().split("\n"):
+            # Format: UserInfo{0:Owner:c13} running
+            match = re.search(r'UserInfo\{(\d+):([^:}]+)', line)
+            if match:
+                users.append({"id": match.group(1), "name": match.group(2)})
+        return users if users else [{"id": "0", "name": "Owner"}]
+
+    def backup_app_for_user(self, serial: str, package: str, user_id: int,
+                            output_path: str) -> bool:
+        """Backup a single app's APK for a specific user profile.
+        APKs are shared across users, so this gets the APK path for the given user."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell",
+                             "pm", "path", "--user", str(user_id), package])
+        if rc != 0 or not out.strip():
+            return False
+        apk_path = out.strip().replace("package:", "").split("\n")[0].strip()
+        if not apk_path:
+            return False
+        return self.pull_file(serial, apk_path, output_path)
 
     def pull_file(self, serial: str, remote: str, local: str) -> bool:
         """Pull a file from device to local."""
@@ -210,6 +240,14 @@ class ADBWrapper:
     def install_apk(self, serial: str, apk_path: str) -> bool:
         """Install an APK on device."""
         rc, out, err = _run([self.adb, "-s", serial, "install", "-r", apk_path], timeout=120)
+        return rc == 0 and "Success" in out
+
+    def install_apk_for_user(self, serial: str, apk_path: str, user_id: int) -> bool:
+        """Install an APK for a specific user profile."""
+        rc, out, err = _run(
+            [self.adb, "-s", serial, "install", "-r", "--user", str(user_id), apk_path],
+            timeout=120
+        )
         return rc == 0 and "Success" in out
 
     def wait_for_device(self, serial: str, timeout: int = 60) -> bool:

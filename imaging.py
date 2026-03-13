@@ -662,11 +662,20 @@ class ImagingEngine:
 
     def create_backup(self, serial: str, output_path: str,
                       include_apps: bool = True,
+                      user_ids: Optional[List[int]] = None,
                       progress_callback: Optional[Callable] = None,
                       status_callback: Optional[Callable] = None) -> str:
         """
         Create a backup of a device (ADB mode).
-        Captures app APKs and user data via ADB backup mechanisms.
+        Captures app APKs from one or more user profiles.
+
+        Args:
+            serial: Device serial number
+            output_path: Directory to save backup
+            include_apps: Whether to include app APKs
+            user_ids: List of user profile IDs to backup (None = all profiles)
+            progress_callback: Progress updates
+            status_callback: Status messages
 
         Returns:
             Path to the created .gbak backup file
@@ -681,39 +690,75 @@ class ImagingEngine:
                 status_callback("Getting device info...")
 
             device_info = self.adb.get_device_info(serial)
-            app_list = self.adb.get_user_packages(serial) if include_apps else []
-            total_steps = len(app_list) + 3 if include_apps else 3
+
+            # Discover all user profiles on the device
+            all_users = self.adb.list_users(serial)
+            if status_callback:
+                user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in all_users)
+                status_callback(f"Found {len(all_users)} user profile(s): {user_names}")
+
+            # Filter to requested user IDs (default = all)
+            if user_ids is not None:
+                target_users = [u for u in all_users if int(u['id']) in user_ids]
+            else:
+                target_users = all_users
+
+            if not target_users:
+                target_users = [{"id": "0", "name": "Owner"}]
+
+            # Collect apps per user profile
+            user_app_map = {}  # user_id -> [packages]
+            all_apks_needed = set()
+
+            if include_apps:
+                for user in target_users:
+                    uid = int(user['id'])
+                    if status_callback:
+                        status_callback(f"Scanning apps for User {uid} ({user['name']})...")
+                    pkgs = self.adb.get_user_packages(serial, user_id=uid)
+                    user_app_map[str(uid)] = pkgs
+                    all_apks_needed.update(pkgs)
+                    if status_callback:
+                        status_callback(f"  Found {len(pkgs)} apps for User {uid}")
+
+            total_apps = len(all_apks_needed)
+            total_steps = total_apps + 3 if include_apps else 3
             current_step = 0
 
-            # Backup APKs
+            # Backup APKs (APKs are shared across users, so only pull each once)
             apps_dir = os.path.join(temp_dir, "apps")
             os.makedirs(apps_dir, exist_ok=True)
 
-            if include_apps and app_list:
-                for pkg in app_list:
+            if include_apps and all_apks_needed:
+                for pkg in sorted(all_apks_needed):
                     self._check_cancel()
                     current_step += 1
 
                     if status_callback:
-                        status_callback(f"Backing up app: {pkg} ({current_step}/{len(app_list)})")
+                        status_callback(f"Backing up app: {pkg} ({current_step}/{total_apps})")
                     if progress_callback:
                         progress_callback(current_step, total_steps, f"Backup {pkg}")
 
                     apk_path = os.path.join(apps_dir, f"{pkg}.apk")
                     self.adb.backup_app(serial, pkg, apk_path)
 
-            # Create manifest
+            # Create manifest with per-user app lists
             current_step += 1
             if progress_callback:
                 progress_callback(current_step, total_steps, "Creating manifest")
+
+            # Flat app_list for backward compatibility
+            flat_app_list = sorted(all_apks_needed) if include_apps else []
 
             manifest = {
                 "type": "backup",
                 "device_serial": device_info.get("serial", serial),
                 "device_model": device_info.get("model", "unknown"),
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "app_list": app_list,
-                "version": "1.0",
+                "app_list": flat_app_list,
+                "user_profiles": [{"id": u["id"], "name": u["name"]} for u in target_users],
+                "user_app_map": user_app_map,
+                "version": "2.0",
             }
 
             with open(os.path.join(temp_dir, "manifest.json"), "w") as f:
@@ -728,7 +773,8 @@ class ImagingEngine:
 
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             model = device_info.get("model", "pixel3").replace(" ", "_")
-            backup_name = f"backup_{model}_{timestamp}{BACKUP_EXTENSION}"
+            n_users = len(target_users)
+            backup_name = f"backup_{model}_{n_users}users_{timestamp}{BACKUP_EXTENSION}"
             backup_path = os.path.join(output_path, backup_name)
 
             with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -739,7 +785,12 @@ class ImagingEngine:
                         zf.write(full, arcname)
 
             if status_callback:
-                status_callback(f"Backup created: {backup_name}")
+                status_callback(
+                    f"Backup created: {backup_name}\n"
+                    f"Profiles backed up: {n_users} | Total unique apps: {total_apps}\n"
+                    f"NOTE: APKs are backed up but app DATA (settings, logins) requires root access "
+                    f"which GrapheneOS does not provide. You will need to re-login to apps after restore."
+                )
 
             return backup_path
 
@@ -748,16 +799,18 @@ class ImagingEngine:
 
     def restore_backup(self, serial: str, backup_path: str,
                        selected_apps: Optional[List[str]] = None,
+                       target_user_ids: Optional[List[int]] = None,
                        progress_callback: Optional[Callable] = None,
                        status_callback: Optional[Callable] = None) -> bool:
         """
         Restore a backup to a device (ADB mode).
-        Installs selected app APKs.
+        Installs selected app APKs to one or more user profiles.
 
         Args:
             serial: Device serial
             backup_path: Path to .gbak file
             selected_apps: List of package names to install (None = all)
+            target_user_ids: User profile IDs to install apps to (None = all from backup)
 
         Returns:
             True if successful
@@ -774,43 +827,107 @@ class ImagingEngine:
 
             # Read manifest
             manifest_path = os.path.join(temp_dir, "manifest.json")
+            manifest = {}
             if os.path.exists(manifest_path):
                 with open(manifest_path) as f:
                     manifest = json.load(f)
-                all_apps = manifest.get("app_list", [])
-            else:
-                all_apps = []
+
+            all_apps = manifest.get("app_list", [])
+            user_app_map = manifest.get("user_app_map", {})
+            user_profiles = manifest.get("user_profiles", [])
 
             apps_to_install = selected_apps if selected_apps is not None else all_apps
             apps_dir = os.path.join(temp_dir, "apps")
 
-            total_steps = len(apps_to_install) + 1
-            current_step = 0
+            # Determine target users on the device
+            device_users = self.adb.list_users(serial)
+            if status_callback:
+                user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
+                status_callback(f"Target device has {len(device_users)} user profile(s): {user_names}")
 
-            for pkg in apps_to_install:
-                self._check_cancel()
-                current_step += 1
-
-                apk_path = os.path.join(apps_dir, f"{pkg}.apk")
-                if not os.path.exists(apk_path):
-                    if status_callback:
-                        status_callback(f"Skipping {pkg} (APK not found)")
-                    continue
-
+            if user_app_map and len(device_users) > 1:
+                # Multi-user restore: install per-user apps
                 if status_callback:
-                    status_callback(f"Installing: {pkg} ({current_step}/{len(apps_to_install)})")
-                if progress_callback:
-                    progress_callback(current_step, total_steps, f"Installing {pkg}")
+                    status_callback("Multi-user backup detected — installing apps per user profile...")
 
-                success = self.adb.install_apk(serial, apk_path)
-                if not success and status_callback:
-                    status_callback(f"WARNING: Failed to install {pkg}")
+                total_installs = 0
+                for user in device_users:
+                    uid_str = user['id']
+                    user_apps = user_app_map.get(uid_str, [])
+                    if selected_apps:
+                        user_apps = [a for a in user_apps if a in selected_apps]
+                    total_installs += len(user_apps)
 
-            current_step += 1
+                total_steps = total_installs + 1
+                current_step = 0
+
+                for user in device_users:
+                    uid = int(user['id'])
+                    uid_str = user['id']
+                    user_apps = user_app_map.get(uid_str, [])
+                    if selected_apps:
+                        user_apps = [a for a in user_apps if a in selected_apps]
+
+                    if not user_apps:
+                        if status_callback:
+                            status_callback(f"No apps to install for User {uid} ({user['name']})")
+                        continue
+
+                    if status_callback:
+                        status_callback(f"\n--- Installing {len(user_apps)} apps for User {uid} ({user['name']}) ---")
+
+                    for pkg in user_apps:
+                        self._check_cancel()
+                        current_step += 1
+
+                        apk_path = os.path.join(apps_dir, f"{pkg}.apk")
+                        if not os.path.exists(apk_path):
+                            if status_callback:
+                                status_callback(f"Skipping {pkg} (APK not found)")
+                            continue
+
+                        if status_callback:
+                            status_callback(f"Installing: {pkg} → User {uid} ({current_step}/{total_installs})")
+                        if progress_callback:
+                            progress_callback(current_step, total_steps, f"Installing {pkg}")
+
+                        # Install for specific user using ADB wrapper
+                        success = self.adb.install_apk_for_user(serial, apk_path, uid)
+                        if not success and status_callback:
+                            status_callback(f"WARNING: Failed to install {pkg} for User {uid}")
+            else:
+                # Standard single-user restore
+                total_steps = len(apps_to_install) + 1
+                current_step = 0
+
+                for pkg in apps_to_install:
+                    self._check_cancel()
+                    current_step += 1
+
+                    apk_path = os.path.join(apps_dir, f"{pkg}.apk")
+                    if not os.path.exists(apk_path):
+                        if status_callback:
+                            status_callback(f"Skipping {pkg} (APK not found)")
+                        continue
+
+                    if status_callback:
+                        status_callback(f"Installing: {pkg} ({current_step}/{len(apps_to_install)})")
+                    if progress_callback:
+                        progress_callback(current_step, total_steps, f"Installing {pkg}")
+
+                    success = self.adb.install_apk(serial, apk_path)
+                    if not success and status_callback:
+                        status_callback(f"WARNING: Failed to install {pkg}")
+
+            current_step = total_steps
             if progress_callback:
                 progress_callback(current_step, total_steps, "Done")
             if status_callback:
-                status_callback("Backup restore complete!")
+                status_callback(
+                    "Backup restore complete!\n"
+                    "NOTE: App DATA (settings, logins, saved content) is NOT included in the backup.\n"
+                    "You will need to log into apps and configure settings manually on each profile."
+                )
 
             return True
 
