@@ -93,10 +93,28 @@ class ImagingEngine:
                 # Enable root access for partition reading
                 if status_callback:
                     status_callback("Enabling root access...")
-                if not self.adb.enable_root(serial):
+                root_ok = self.adb.enable_root(serial)
+                if root_ok:
+                    # Verify root is actually working
+                    if not self.adb.is_root(serial):
+                        root_ok = False
+
+                if not root_ok:
+                    error_msg = (
+                        "ROOT ACCESS FAILED!\n\n"
+                        "Image creation requires root access to read device partitions.\n"
+                        "Without root, all partition dumps will be empty (0 bytes).\n\n"
+                        "To fix this on GrapheneOS:\n"
+                        "1. Go to Settings → System → Developer Options\n"
+                        "2. Find 'Root access' or 'Enable root access via ADB'\n"
+                        "3. Turn it ON\n"
+                        "4. Reconnect USB and try again\n\n"
+                        "Note: You may need to install the 'userdebug' variant of GrapheneOS\n"
+                        "for root access support. The standard release does NOT support ADB root."
+                    )
                     if status_callback:
-                        status_callback("WARNING: Could not enable root. Ensure root access is enabled in Developer Options.")
-                    # Try anyway - some devices allow dd without explicit root
+                        status_callback(f"ERROR: {error_msg}")
+                    raise Exception(error_msg)
             else:
                 device_info = self.fastboot.get_device_info(serial)
                 device_codename = device_info.get("product", "").lower()
@@ -160,6 +178,17 @@ class ImagingEngine:
                         pass
 
             self._check_cancel()
+
+            if len(failed_partitions) == len(partitions):
+                error_msg = (
+                    f"ALL {len(partitions)} partitions failed to dump!\n"
+                    "This usually means root access is not working properly.\n"
+                    "The resulting image would be empty and unusable.\n\n"
+                    "Make sure root access via ADB is enabled in Developer Options."
+                )
+                if status_callback:
+                    status_callback(f"ERROR: {error_msg}")
+                raise Exception(error_msg)
 
             if failed_partitions and status_callback:
                 status_callback(f"Note: {len(failed_partitions)} partition(s) could not be read: {', '.join(failed_partitions)}")

@@ -137,9 +137,8 @@ class MainWindow(QMainWindow):
             ("📸  Create Image", 1),
             ("📋  Clone Device", 2),
             ("💾  Backup", 3),
-            ("♻️  Restore", 4),
-            ("📱  App Selector", 5),
-            ("📜  Log", 6),
+            ("📱  App Selector", 4),
+            ("📜  Log", 5),
         ]
         for label, idx in pages:
             btn = QPushButton(label)
@@ -164,7 +163,6 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._page_create_image())
         self.pages.addWidget(self._page_clone())
         self.pages.addWidget(self._page_backup())
-        self.pages.addWidget(self._page_restore())
         self.pages.addWidget(self._page_app_selector())
         self.pages.addWidget(self._page_log())
         body.addWidget(self.pages)
@@ -225,7 +223,6 @@ class MainWindow(QMainWindow):
             ("📸 Create Image", "Capture full system image\nfrom master device", 1, "#0f3460"),
             ("📋 Clone Device", "Flash image onto\ntarget devices", 2, "#0f3460"),
             ("💾 Backup", "Backup apps and data\nfrom any device", 3, "#0f3460"),
-            ("♻️ Restore", "Restore backup to\na device", 4, "#0f3460"),
         ]
         for title, desc_text, nav_idx, color in cards:
             card = self._make_action_card(title, desc_text, nav_idx)
