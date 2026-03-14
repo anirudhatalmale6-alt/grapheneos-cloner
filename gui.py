@@ -1318,10 +1318,15 @@ class MainWindow(QMainWindow):
         self._log("Opening Command Prompt...")
 
         # Open Command Prompt in the script directory
+        # CRITICAL: Add script_dir to PATH so flash-all.bat can find fastboot
+        # (GrapheneOS flash-all.bat uses PowerShell which won't find ./fastboot)
         if os.name == "nt":
             import subprocess
+            env = os.environ.copy()
+            env["PATH"] = script_dir + ";" + env.get("PATH", "")
             subprocess.Popen(
                 ["cmd", "/k",
+                 f'set PATH={script_dir};%PATH% && '
                  f'echo. && echo ============================================ && '
                  f'echo GrapheneOS Manual Flash && '
                  f'echo ============================================ && '
@@ -1336,7 +1341,8 @@ class MainWindow(QMainWindow):
                  f'echo. && '
                  f'echo Current directory: {script_dir} && '
                  f'echo. '],
-                cwd=script_dir
+                cwd=script_dir,
+                env=env
             )
         else:
             import subprocess
