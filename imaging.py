@@ -1085,7 +1085,7 @@ class ImagingEngine:
                     # Try each user_id where this app is installed
                     for try_uid in owner_uids:
                         _log(f"  [{pkg}] Trying pm path --user {try_uid} ...")
-                        rc, out, err = self.adb.shell(serial,
+                        rc, out = self.adb.shell(serial,
                             f"pm path --user {try_uid} {pkg}")
                         raw = (out or "").strip()
                         _log(f"    pm path rc={rc}, output='{raw}'")
