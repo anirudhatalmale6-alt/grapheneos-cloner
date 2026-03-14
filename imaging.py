@@ -1056,11 +1056,22 @@ class ImagingEngine:
             total_steps = total_apps + 3 if include_apps else 3
             current_step = 0
 
-            # Backup APKs (APKs are shared across users, so only pull each once)
+            # Backup APKs — use per-user pm path to find APK for each package
+            # Some apps may only be installed for a specific user, so we need
+            # to use --user flag with pm path to find the APK.
             apps_dir = os.path.join(temp_dir, "apps")
             os.makedirs(apps_dir, exist_ok=True)
 
+            # Build a map: package -> user_id where it's installed (for APK path lookup)
+            pkg_to_user = {}
+            for uid_str, pkgs in user_app_map.items():
+                for pkg in pkgs:
+                    if pkg not in pkg_to_user:
+                        pkg_to_user[pkg] = int(uid_str)
+
             if include_apps and all_apks_needed:
+                pulled_ok = 0
+                pulled_fail = 0
                 for pkg in sorted(all_apks_needed):
                     self._check_cancel()
                     current_step += 1
@@ -1071,7 +1082,20 @@ class ImagingEngine:
                         progress_callback(current_step, total_steps, f"Backup {pkg}")
 
                     apk_path = os.path.join(apps_dir, f"{pkg}.apk")
-                    self.adb.backup_app(serial, pkg, apk_path)
+                    # Use backup_app_for_user with the user_id where this app exists
+                    owner_uid = pkg_to_user.get(pkg, 0)
+                    ok = self.adb.backup_app_for_user(serial, pkg, owner_uid, apk_path)
+                    if not ok:
+                        # Fallback: try without --user flag
+                        ok = self.adb.backup_app(serial, pkg, apk_path)
+                    if ok:
+                        pulled_ok += 1
+                        _log(f"  OK pulled APK: {pkg} (via User {owner_uid})")
+                    else:
+                        pulled_fail += 1
+                        _log(f"  FAIL pulling APK: {pkg} (tried User {owner_uid} and default)")
+
+                _log(f"APK pull summary: {pulled_ok} OK, {pulled_fail} failed out of {total_apps}")
 
             # Create manifest with per-user app lists, settings, and permissions
             current_step += 1
