@@ -1261,13 +1261,34 @@ class ImagingEngine:
                     user_app_sets[uid_str] = set(user_apps)
                     all_unique_apps.update(user_apps)
 
+                # ── DIAGNOSTIC: Show exactly what each profile should have ──
+                if status_callback:
+                    status_callback(f"\n{'='*50}")
+                    status_callback(f"DIAGNOSTIC: Backup contains {len(all_unique_apps)} unique apps across {len(user_app_sets)} profiles")
+                    for uid_str, apps in sorted(user_app_sets.items()):
+                        status_callback(f"  User {uid_str}: {len(apps)} apps")
+                        for a in sorted(apps):
+                            status_callback(f"    - {a}")
+                    # Show differences
+                    uid_list = sorted(user_app_sets.keys())
+                    if len(uid_list) == 2:
+                        u1, u2 = uid_list
+                        only_u1 = user_app_sets[u1] - user_app_sets[u2]
+                        only_u2 = user_app_sets[u2] - user_app_sets[u1]
+                        shared = user_app_sets[u1] & user_app_sets[u2]
+                        status_callback(f"\n  SHARED between both profiles: {len(shared)} apps")
+                        status_callback(f"  ONLY in User {u1}: {len(only_u1)} apps → {sorted(only_u1)}")
+                        status_callback(f"  ONLY in User {u2}: {len(only_u2)} apps → {sorted(only_u2)}")
+                    status_callback(f"{'='*50}\n")
+
                 # Step 1: Install all unique APKs globally
                 total_steps = len(all_unique_apps) + len(device_users) + 1
                 current_step = 0
 
                 if status_callback:
-                    status_callback(f"\n--- Step 1: Installing {len(all_unique_apps)} unique apps ---")
+                    status_callback(f"--- Step 1: Installing {len(all_unique_apps)} unique apps (global install) ---")
 
+                installed_apps = set()
                 for pkg in sorted(all_unique_apps):
                     self._check_cancel()
                     current_step += 1
@@ -1275,21 +1296,26 @@ class ImagingEngine:
                     apk_path = os.path.join(apps_dir, f"{pkg}.apk")
                     if not os.path.exists(apk_path):
                         if status_callback:
-                            status_callback(f"Skipping {pkg} (APK not found)")
+                            status_callback(f"  SKIP {pkg} (APK file not in backup)")
                         continue
 
                     if status_callback:
-                        status_callback(f"Installing: {pkg} ({current_step}/{len(all_unique_apps)})")
+                        status_callback(f"  Installing: {pkg} ({current_step}/{len(all_unique_apps)})")
                     if progress_callback:
                         progress_callback(current_step, total_steps, f"Installing {pkg}")
 
                     success = self.adb.install_apk(serial, apk_path)
-                    if not success and status_callback:
-                        status_callback(f"WARNING: Failed to install {pkg}")
+                    if success:
+                        installed_apps.add(pkg)
+                    elif status_callback:
+                        status_callback(f"  WARNING: Failed to install {pkg}")
+
+                if status_callback:
+                    status_callback(f"\n  Installed {len(installed_apps)}/{len(all_unique_apps)} apps globally")
 
                 # Step 2: Remove apps from each profile that shouldn't have them
                 if status_callback:
-                    status_callback(f"\n--- Step 2: Configuring apps per user profile ---")
+                    status_callback(f"\n--- Step 2: Removing apps from profiles that shouldn't have them ---")
 
                 for user in device_users:
                     uid = int(user['id'])
@@ -1297,27 +1323,54 @@ class ImagingEngine:
                     current_step += 1
 
                     apps_for_this_user = user_app_sets.get(uid_str, set())
-                    apps_to_remove = all_unique_apps - apps_for_this_user
+                    # Only try to remove apps that were actually installed
+                    apps_to_remove = installed_apps - apps_for_this_user
+
+                    if status_callback:
+                        status_callback(f"\n  User {uid} ({user['name']}): should have {len(apps_for_this_user)} apps, removing {len(apps_to_remove)}")
 
                     if not apps_to_remove:
                         if status_callback:
-                            status_callback(f"User {uid} ({user['name']}): keeping all {len(apps_for_this_user)} apps")
+                            status_callback(f"    → Nothing to remove, keeping all apps")
                         continue
-
-                    if status_callback:
-                        status_callback(f"User {uid} ({user['name']}): removing {len(apps_to_remove)} apps not in this profile...")
 
                     if progress_callback:
                         progress_callback(current_step, total_steps, f"Configuring User {uid}")
 
                     removed = 0
-                    for pkg in apps_to_remove:
-                        ok = self.adb.uninstall_for_user(serial, pkg, uid)
+                    failed_removes = []
+                    for pkg in sorted(apps_to_remove):
+                        ok, output = self.adb.uninstall_for_user(serial, pkg, uid)
                         if ok:
                             removed += 1
+                            if status_callback:
+                                status_callback(f"    ✓ Removed {pkg} from User {uid}")
+                        else:
+                            failed_removes.append((pkg, output))
+                            if status_callback:
+                                status_callback(f"    ✗ FAILED to remove {pkg} from User {uid}: {output}")
 
                     if status_callback:
-                        status_callback(f"  Removed {removed}/{len(apps_to_remove)} apps from User {uid}")
+                        status_callback(f"    Result: {removed}/{len(apps_to_remove)} removed")
+                        if failed_removes:
+                            status_callback(f"    Failed: {[p for p, _ in failed_removes]}")
+
+                # Step 3: Verify the result
+                if status_callback:
+                    status_callback(f"\n--- Step 3: Verifying app lists per profile ---")
+                    for user in device_users:
+                        uid = int(user['id'])
+                        actual_apps = self.adb.get_user_packages(serial, user_id=uid)
+                        expected = user_app_sets.get(user['id'], set())
+                        status_callback(f"  User {uid} ({user['name']}): {len(actual_apps)} apps installed (expected {len(expected)})")
+                        extra = set(actual_apps) - expected
+                        missing = expected - set(actual_apps)
+                        if extra:
+                            status_callback(f"    EXTRA apps (shouldn't be here): {sorted(extra)}")
+                        if missing:
+                            status_callback(f"    MISSING apps (should be here): {sorted(missing)}")
+                        if not extra and not missing:
+                            status_callback(f"    ✓ Perfect match!")
 
             else:
                 # Standard single-user restore

@@ -816,13 +816,55 @@ class MainWindow(QMainWindow):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet(
+            "QTextEdit { background-color: #1a1a2e; color: #00ff41; "
+            "font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; "
+            "border: 2px solid #333; padding: 8px; }"
+        )
         layout.addWidget(self.log_text, 1)
+
+        btn_row = QHBoxLayout()
+        btn_save = QPushButton("Save Log to File")
+        btn_save.setToolTip("Save the full log to a text file you can share for diagnostics")
+        btn_save.clicked.connect(self._save_log_to_file)
+        btn_row.addWidget(btn_save)
+
+        btn_copy = QPushButton("Copy Log to Clipboard")
+        btn_copy.clicked.connect(self._copy_log_to_clipboard)
+        btn_row.addWidget(btn_copy)
 
         btn_clear = QPushButton("Clear Log")
         btn_clear.clicked.connect(self.log_text.clear)
-        layout.addWidget(btn_clear, 0, Qt.AlignRight)
+        btn_row.addWidget(btn_clear)
+
+        layout.addLayout(btn_row)
 
         return page
+
+    def _save_log_to_file(self):
+        """Save log contents to a timestamped text file on Desktop."""
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.isdir(desktop):
+            desktop = os.path.expanduser("~")
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(desktop, f"GrapheneOS_Cloner_Log_{timestamp}.txt")
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"GrapheneOS Cloner v{APP_VERSION} — Diagnostic Log\n")
+                f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write("=" * 60 + "\n\n")
+                f.write(self.log_text.toPlainText())
+            QMessageBox.information(self, "Log Saved", f"Log saved to:\n{log_path}")
+            self._log(f"Log saved to: {log_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not save log: {e}")
+
+    def _copy_log_to_clipboard(self):
+        """Copy log contents to clipboard."""
+        from PyQt5.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.log_text.toPlainText())
+        self._log("Log copied to clipboard")
 
     # ──────────────────────────────────────────────
     # DEVICE POLLING

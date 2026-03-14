@@ -269,14 +269,15 @@ class ADBWrapper:
         )
         return rc == 0 and "Success" in out
 
-    def uninstall_for_user(self, serial: str, package: str, user_id: int) -> bool:
-        """Uninstall a package for a specific user only (keeps data with -k)."""
+    def uninstall_for_user(self, serial: str, package: str, user_id: int) -> tuple:
+        """Uninstall a package for a specific user only.
+        Returns (success: bool, output: str)."""
         rc, out, err = _run(
             [self.adb, "-s", serial, "shell", "pm", "uninstall",
-             "-k", "--user", str(user_id), package],
+             "--user", str(user_id), package],
             timeout=30
         )
-        return rc == 0
+        return rc == 0, (out + err).strip()
 
     def get_settings(self, serial: str, namespace: str,
                      user_id: Optional[int] = None) -> Dict[str, str]:
