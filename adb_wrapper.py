@@ -186,6 +186,25 @@ class ADBWrapper:
                 users.append({"id": match.group(1), "name": match.group(2)})
         return users if users else [{"id": "0", "name": "Owner"}]
 
+    def create_user(self, serial: str, name: str) -> Optional[int]:
+        """Create a new user profile on the device.
+        Returns the new user ID, or None on failure."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell",
+                             "pm", "create-user", name], timeout=15)
+        if rc != 0:
+            return None
+        # Output format: "Success: created user id 10"
+        match = re.search(r'id\s+(\d+)', out)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def start_user(self, serial: str, user_id: int) -> bool:
+        """Start a user profile so apps can be installed to it."""
+        rc, out, err = _run([self.adb, "-s", serial, "shell",
+                             "am", "start-user", str(user_id)], timeout=15)
+        return rc == 0
+
     def backup_app_for_user(self, serial: str, package: str, user_id: int,
                             output_path: str) -> bool:
         """Backup a single app's APK for a specific user profile.

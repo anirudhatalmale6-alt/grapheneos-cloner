@@ -1176,7 +1176,73 @@ class ImagingEngine:
                 user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
                 status_callback(f"Target device has {len(device_users)} user profile(s): {user_names}")
 
-            if user_app_map and len(device_users) > 1:
+            # If backup has multiple user profiles, create missing ones on target
+            if user_app_map and len(user_app_map) > 1 and user_profiles:
+                existing_ids = {u['id'] for u in device_users}
+                # Map from old user ID → new user ID (for profiles we create)
+                uid_remap = {}
+
+                for profile in user_profiles:
+                    pid = profile['id']
+                    pname = profile.get('name', f'User {pid}')
+
+                    if pid in existing_ids:
+                        uid_remap[pid] = pid  # already exists, no remap
+                        continue
+
+                    # Skip creating user 0 (Owner) — always exists
+                    if pid == '0':
+                        uid_remap['0'] = '0'
+                        continue
+
+                    if status_callback:
+                        status_callback(f"Creating user profile '{pname}' on target device...")
+
+                    new_uid = self.adb.create_user(serial, pname)
+                    if new_uid is not None:
+                        uid_remap[pid] = str(new_uid)
+                        # Start the user so apps can be installed
+                        self.adb.start_user(serial, new_uid)
+                        if status_callback:
+                            status_callback(f"  Created user '{pname}' (ID {new_uid})")
+                        time.sleep(2)  # Give system time to initialize user
+                    else:
+                        if status_callback:
+                            status_callback(f"  WARNING: Could not create user '{pname}' — apps for this profile will be skipped")
+
+                # Refresh device users list after creating profiles
+                device_users = self.adb.list_users(serial)
+                if status_callback:
+                    user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
+                    status_callback(f"Target device now has {len(device_users)} user profile(s): {user_names}")
+
+                # Remap the user_app_map keys to match new user IDs on target
+                remapped_app_map = {}
+                for old_uid, apps in user_app_map.items():
+                    new_uid = uid_remap.get(old_uid)
+                    if new_uid is not None:
+                        remapped_app_map[new_uid] = apps
+                    else:
+                        if status_callback:
+                            status_callback(f"  Skipping apps for backup User {old_uid} (profile not created)")
+                user_app_map = remapped_app_map
+
+                # Also remap user_settings and user_permissions
+                user_settings_raw = manifest.get("user_settings", {})
+                user_perms_raw = manifest.get("user_permissions", {})
+                remapped_settings = {}
+                remapped_perms = {}
+                for old_uid in uid_remap:
+                    new_uid = uid_remap[old_uid]
+                    if old_uid in user_settings_raw:
+                        remapped_settings[new_uid] = user_settings_raw[old_uid]
+                    if old_uid in user_perms_raw:
+                        remapped_perms[new_uid] = user_perms_raw[old_uid]
+                # Write back so the settings/permissions restore below uses remapped IDs
+                manifest['user_settings'] = remapped_settings
+                manifest['user_permissions'] = remapped_perms
+
+            if user_app_map and len(user_app_map) > 1:
                 # Multi-user restore: install per-user apps
                 if status_callback:
                     status_callback("Multi-user backup detected — installing apps per user profile...")
