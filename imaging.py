@@ -1057,17 +1057,14 @@ class ImagingEngine:
             current_step = 0
 
             # Backup APKs — use per-user pm path to find APK for each package
-            # Some apps may only be installed for a specific user, so we need
-            # to use --user flag with pm path to find the APK.
             apps_dir = os.path.join(temp_dir, "apps")
             os.makedirs(apps_dir, exist_ok=True)
 
-            # Build a map: package -> user_id where it's installed (for APK path lookup)
-            pkg_to_user = {}
+            # Build map: package -> list of user_ids where it's installed
+            pkg_to_users = {}
             for uid_str, pkgs in user_app_map.items():
                 for pkg in pkgs:
-                    if pkg not in pkg_to_user:
-                        pkg_to_user[pkg] = int(uid_str)
+                    pkg_to_users.setdefault(pkg, []).append(int(uid_str))
 
             if include_apps and all_apks_needed:
                 pulled_ok = 0
@@ -1081,21 +1078,68 @@ class ImagingEngine:
                     if progress_callback:
                         progress_callback(current_step, total_steps, f"Backup {pkg}")
 
-                    apk_path = os.path.join(apps_dir, f"{pkg}.apk")
-                    # Use backup_app_for_user with the user_id where this app exists
-                    owner_uid = pkg_to_user.get(pkg, 0)
-                    ok = self.adb.backup_app_for_user(serial, pkg, owner_uid, apk_path)
+                    local_apk = os.path.join(apps_dir, f"{pkg}.apk")
+                    owner_uids = pkg_to_users.get(pkg, [0])
+                    ok = False
+
+                    # Try each user_id where this app is installed
+                    for try_uid in owner_uids:
+                        _log(f"  [{pkg}] Trying pm path --user {try_uid} ...")
+                        rc, out, err = self.adb.shell(serial,
+                            f"pm path --user {try_uid} {pkg}")
+                        raw = (out or "").strip()
+                        _log(f"    pm path rc={rc}, output='{raw}'")
+
+                        if rc != 0 or not raw:
+                            continue
+
+                        # Parse all APK paths (split APKs have multiple lines)
+                        apk_paths = []
+                        for line in raw.split("\n"):
+                            line = line.strip()
+                            if line.startswith("package:"):
+                                apk_paths.append(line.replace("package:", "").strip())
+                        _log(f"    Found {len(apk_paths)} APK path(s): {apk_paths}")
+
+                        if not apk_paths:
+                            continue
+
+                        # Pull the base/first APK
+                        device_path = apk_paths[0]
+                        _log(f"    Pulling: {device_path}")
+                        pull_ok = self.adb.pull_file(serial, device_path, local_apk)
+                        if pull_ok and os.path.exists(local_apk):
+                            fsize = os.path.getsize(local_apk)
+                            _log(f"    Pull OK! File size: {fsize} bytes")
+                            ok = True
+                            break
+                        else:
+                            _log(f"    Pull FAILED for {device_path}")
+
+                    # Fallback: try without --user flag
                     if not ok:
-                        # Fallback: try without --user flag
-                        ok = self.adb.backup_app(serial, pkg, apk_path)
+                        _log(f"  [{pkg}] Fallback: pm path without --user ...")
+                        rc, out = self.adb.shell(serial, f"pm path {pkg}")
+                        raw = (out or "").strip()
+                        _log(f"    pm path rc={rc}, output='{raw}'")
+                        if rc == 0 and raw:
+                            device_path = raw.replace("package:", "").split("\n")[0].strip()
+                            if device_path:
+                                pull_ok = self.adb.pull_file(serial, device_path, local_apk)
+                                if pull_ok and os.path.exists(local_apk):
+                                    fsize = os.path.getsize(local_apk)
+                                    _log(f"    Fallback pull OK! Size: {fsize} bytes")
+                                    ok = True
+                                else:
+                                    _log(f"    Fallback pull FAILED")
+
                     if ok:
                         pulled_ok += 1
-                        _log(f"  OK pulled APK: {pkg} (via User {owner_uid})")
                     else:
                         pulled_fail += 1
-                        _log(f"  FAIL pulling APK: {pkg} (tried User {owner_uid} and default)")
+                        _log(f"  [{pkg}] ALL PULL ATTEMPTS FAILED")
 
-                _log(f"APK pull summary: {pulled_ok} OK, {pulled_fail} failed out of {total_apps}")
+                _log(f"\nAPK pull summary: {pulled_ok} OK, {pulled_fail} failed out of {total_apps}")
 
             # Create manifest with per-user app lists, settings, and permissions
             current_step += 1
