@@ -538,3 +538,103 @@ class FastbootWrapper:
         cmd.extend(["update", image_zip_path])
         rc, output = _run_stream(cmd, progress_callback, timeout=1800)
         return rc == 0, output
+
+    def flashall(self, serial: str, img_dir: str, wipe: bool = True,
+                 progress_callback: Optional[Callable] = None) -> Tuple[bool, str]:
+        """Flash using 'fastboot flashall' with ANDROID_PRODUCT_OUT.
+        Equivalent to 'fastboot update' but reads .img files from a directory
+        instead of a ZIP. Properly handles A/B slots and vbmeta.
+        """
+        env = os.environ.copy()
+        env["ANDROID_PRODUCT_OUT"] = img_dir
+
+        cmd = [self.fastboot, "-s", serial]
+        if wipe:
+            cmd.append("-w")
+        cmd.append("flashall")
+
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "bufsize": 1,
+            "universal_newlines": True,
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            # Don't hide console — fastboot needs proper I/O on Windows
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            kwargs["startupinfo"] = si
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            output_lines = []
+            for line in proc.stdout:
+                line = line.strip()
+                output_lines.append(line)
+                if progress_callback:
+                    progress_callback(line)
+            proc.wait(timeout=1800)
+            return proc.returncode == 0, "\n".join(output_lines)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return False, "Command timed out"
+        except Exception as e:
+            return False, str(e)
+
+    def run_flash_script(self, script_path: str, script_dir: str,
+                         progress_callback: Optional[Callable] = None) -> Tuple[bool, str]:
+        """Run the official flash-all.bat/.sh script from the factory image.
+        This is the most reliable method — it's the exact same process
+        GrapheneOS officially recommends.
+        Args:
+            script_path: Full path to flash-all.bat or flash-all.sh
+            script_dir: Directory containing the script and image files
+        """
+        # Copy our fastboot binary to the script directory so the script finds it
+        fastboot_name = os.path.basename(self.fastboot)
+        target_fastboot = os.path.join(script_dir, fastboot_name)
+        if not os.path.exists(target_fastboot):
+            import shutil
+            shutil.copy2(self.fastboot, target_fastboot)
+            # Also copy fastboot dependencies if they exist (Windows .dll files)
+            fastboot_dir = os.path.dirname(self.fastboot)
+            for f in os.listdir(fastboot_dir):
+                if f.endswith(".dll") or f == "AdbWinApi.dll" or f == "AdbWinUsbApi.dll":
+                    src = os.path.join(fastboot_dir, f)
+                    dst = os.path.join(script_dir, f)
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+
+        if os.name == "nt":
+            cmd = ["cmd", "/c", os.path.basename(script_path)]
+        else:
+            cmd = ["sh", os.path.basename(script_path)]
+
+        kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+            "bufsize": 1,
+            "universal_newlines": True,
+            "cwd": script_dir,
+            "stdin": subprocess.DEVNULL,
+        }
+
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+            output_lines = []
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    output_lines.append(line)
+                    if progress_callback:
+                        progress_callback(line)
+            proc.wait(timeout=1800)
+            return proc.returncode == 0, "\n".join(output_lines)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return False, "Flash script timed out"
+        except Exception as e:
+            return False, str(e)
