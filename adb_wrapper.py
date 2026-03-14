@@ -410,8 +410,8 @@ class ADBWrapper:
                 progress_callback(f"ERROR dumping {partition}: {str(e)}")
             return False
 
-    def get_user_packages(self, serial: str) -> List[str]:
-        """Get list of user-installed packages."""
+    def get_all_packages(self, serial: str) -> List[str]:
+        """Get list of all installed packages (user + system)."""
         return self.get_installed_packages(serial)
 
 

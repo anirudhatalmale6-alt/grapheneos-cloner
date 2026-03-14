@@ -513,6 +513,16 @@ class MainWindow(QMainWindow):
         self.btn_flash_factory.clicked.connect(self._start_flash_factory)
         factory_layout.addWidget(self.btn_flash_factory)
 
+        # Manual flash option for bootloader locking
+        self.btn_manual_flash = QPushButton("Manual Flash via Command Prompt (for Bootloader Locking)")
+        self.btn_manual_flash.setToolTip(
+            "Extracts the factory image and opens a Command Prompt so you can run\n"
+            "flash-all.bat manually. This is the most reliable method for\n"
+            "bootloader locking — it's the official GrapheneOS-recommended process."
+        )
+        self.btn_manual_flash.clicked.connect(self._manual_flash_factory)
+        factory_layout.addWidget(self.btn_manual_flash)
+
         # Check if factory image already downloaded (must be after factory_image_path is created)
         self._check_bundled_factory_image()
 
@@ -1254,6 +1264,102 @@ class MainWindow(QMainWindow):
         if path:
             self.factory_image_path.setText(path)
             self._log(f"Factory image selected: {path}")
+
+    def _manual_flash_factory(self):
+        """Extract factory image and open Command Prompt for manual flash-all.bat execution."""
+        factory_path = self.factory_image_path.text()
+        if not os.path.isfile(factory_path):
+            QMessageBox.warning(self, "No File", "Select a GrapheneOS factory image ZIP first.")
+            return
+
+        import zipfile as zf_mod
+        import tempfile
+
+        self._log("Extracting factory image for manual flash...")
+        self.clone_status.setText("Extracting factory image...")
+
+        # Extract to a short, accessible path
+        extract_dir = os.path.join(os.path.expanduser("~"), "GrapheneOS_Flash")
+        os.makedirs(extract_dir, exist_ok=True)
+
+        try:
+            with zf_mod.ZipFile(factory_path, "r") as zf:
+                zf.extractall(extract_dir)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to extract: {e}")
+            return
+
+        # Find the directory containing flash-all.bat/sh
+        script_dir = extract_dir
+        for root, dirs, files in os.walk(extract_dir):
+            if "flash-all.bat" in files or "flash-all.sh" in files:
+                script_dir = root
+                break
+
+        # Copy platform-tools (fastboot) to the script directory
+        from config import get_fastboot_path
+        fastboot_src = get_fastboot_path()
+        if os.path.exists(fastboot_src):
+            import shutil
+            fastboot_name = os.path.basename(fastboot_src)
+            dst = os.path.join(script_dir, fastboot_name)
+            if not os.path.exists(dst):
+                shutil.copy2(fastboot_src, dst)
+            # Copy DLLs too
+            fb_dir = os.path.dirname(fastboot_src)
+            for f in os.listdir(fb_dir):
+                if f.endswith(".dll"):
+                    src = os.path.join(fb_dir, f)
+                    d = os.path.join(script_dir, f)
+                    if not os.path.exists(d):
+                        shutil.copy2(src, d)
+
+        self._log(f"Factory image extracted to: {script_dir}")
+        self._log("Opening Command Prompt...")
+
+        # Open Command Prompt in the script directory
+        if os.name == "nt":
+            import subprocess
+            subprocess.Popen(
+                ["cmd", "/k",
+                 f'echo. && echo ============================================ && '
+                 f'echo GrapheneOS Manual Flash && '
+                 f'echo ============================================ && '
+                 f'echo. && '
+                 f'echo 1. Make sure phone is in FASTBOOT mode && '
+                 f'echo    (Power + Volume Down) && '
+                 f'echo 2. Type: flash-all.bat && '
+                 f'echo 3. Wait for flash to complete && '
+                 f'echo 4. After phone boots, go back to fastboot && '
+                 f'echo 5. Type: fastboot flashing lock && '
+                 f'echo 6. Confirm on phone screen && '
+                 f'echo. && '
+                 f'echo Current directory: {script_dir} && '
+                 f'echo. '],
+                cwd=script_dir
+            )
+        else:
+            import subprocess
+            subprocess.Popen(["xterm", "-e", "bash"], cwd=script_dir)
+
+        self.clone_status.setText(
+            f"Command Prompt opened in: {script_dir}\n"
+            "Type 'flash-all.bat' to flash, then 'fastboot flashing lock' to lock bootloader."
+        )
+
+        QMessageBox.information(
+            self, "Manual Flash",
+            "A Command Prompt has been opened in the factory image directory.\n\n"
+            "Steps:\n"
+            "1. Make sure phone is in FASTBOOT mode (Power + Volume Down)\n"
+            "2. Type: flash-all.bat\n"
+            "3. Wait for it to finish (phone will reboot)\n"
+            "4. After phone boots, go back to fastboot (Power + Volume Down)\n"
+            "5. Type: fastboot flashing lock\n"
+            "6. Confirm on the phone screen\n\n"
+            "This is the official GrapheneOS flashing method and the most\n"
+            "reliable way to get bootloader locking working."
+        )
 
     def _start_flash_factory(self):
         factory_path = self.factory_image_path.text()
