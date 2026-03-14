@@ -953,17 +953,27 @@ class ImagingEngine:
 
         temp_dir = tempfile.mkdtemp(prefix="gcloner_backup_")
 
-        try:
+        # Diagnostic log file for backup
+        log_path = os.path.join(output_path, f"backup_diagnostic_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        diag_log = open(log_path, "w", encoding="utf-8")
+
+        def _log(msg):
+            ts = time.strftime("%H:%M:%S")
+            diag_log.write(f"[{ts}] {msg}\n")
+            diag_log.flush()
             if status_callback:
-                status_callback("Getting device info...")
+                status_callback(msg)
+
+        try:
+            _log("Getting device info...")
 
             device_info = self.adb.get_device_info(serial)
+            _log(f"Device: {device_info}")
 
             # Discover all user profiles on the device
             all_users = self.adb.list_users(serial)
-            if status_callback:
-                user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in all_users)
-                status_callback(f"Found {len(all_users)} user profile(s): {user_names}")
+            user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in all_users)
+            _log(f"Found {len(all_users)} user profile(s): {user_names}")
 
             # Filter to requested user IDs (default = all)
             if user_ids is not None:
@@ -981,13 +991,12 @@ class ImagingEngine:
             if include_apps:
                 for user in target_users:
                     uid = int(user['id'])
-                    if status_callback:
-                        status_callback(f"Scanning apps for User {uid} ({user['name']})...")
+                    _log(f"Scanning apps for User {uid} ({user['name']})...")
+                    _log(f"  Running: pm list packages --user {uid} -3")
                     pkgs = self.adb.get_user_packages(serial, user_id=uid)
                     user_app_map[str(uid)] = pkgs
                     all_apks_needed.update(pkgs)
-                    if status_callback:
-                        status_callback(f"  Found {len(pkgs)} apps for User {uid}")
+                    _log(f"  Found {len(pkgs)} apps for User {uid}: {sorted(pkgs)}")
 
             # ── Capture per-user system settings ──
             # Settings that can be read/written via ADB without root
@@ -1114,18 +1123,17 @@ class ImagingEngine:
                 for ns in user_settings_map.values()
             ) + len(global_settings)
 
-            if status_callback:
-                status_callback(
-                    f"Backup created: {backup_name}\n"
-                    f"Profiles: {n_users} | Apps: {total_apps} | Settings: {total_settings}\n"
-                    f"Includes: APKs, system/secure/global settings, app permissions per profile.\n"
-                    f"NOTE: App DATA (logins, saved content) requires root which GrapheneOS blocks.\n"
-                    f"You will need to re-login to apps after restore, but settings will be applied."
-                )
+            _log(
+                f"Backup created: {backup_name}\n"
+                f"Profiles: {n_users} | Apps: {total_apps} | Settings: {total_settings}\n"
+                f"Includes: APKs, system/secure/global settings, app permissions per profile.\n"
+                f"Diagnostic log: {log_path}"
+            )
 
             return backup_path
 
         finally:
+            diag_log.close()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def restore_backup(self, serial: str, backup_path: str,
