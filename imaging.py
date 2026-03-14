@@ -1243,55 +1243,82 @@ class ImagingEngine:
                 manifest['user_permissions'] = remapped_perms
 
             if user_app_map and len(user_app_map) > 1:
-                # Multi-user restore: install per-user apps
+                # Multi-user restore strategy:
+                # 1. Install ALL unique APKs globally (adb install makes apps available to all users)
+                # 2. Then UNINSTALL apps from each profile that shouldn't have them
+                # This is the only reliable way because adb install --user is often ignored
                 if status_callback:
-                    status_callback("Multi-user backup detected — installing apps per user profile...")
+                    status_callback("Multi-user backup detected — installing apps then configuring per profile...")
 
-                total_installs = 0
+                # Collect all unique packages and per-user app sets
+                all_unique_apps = set()
+                user_app_sets = {}  # uid_str -> set of packages
                 for user in device_users:
                     uid_str = user['id']
                     user_apps = user_app_map.get(uid_str, [])
                     if selected_apps:
                         user_apps = [a for a in user_apps if a in selected_apps]
-                    total_installs += len(user_apps)
+                    user_app_sets[uid_str] = set(user_apps)
+                    all_unique_apps.update(user_apps)
 
-                total_steps = total_installs + 1
+                # Step 1: Install all unique APKs globally
+                total_steps = len(all_unique_apps) + len(device_users) + 1
                 current_step = 0
+
+                if status_callback:
+                    status_callback(f"\n--- Step 1: Installing {len(all_unique_apps)} unique apps ---")
+
+                for pkg in sorted(all_unique_apps):
+                    self._check_cancel()
+                    current_step += 1
+
+                    apk_path = os.path.join(apps_dir, f"{pkg}.apk")
+                    if not os.path.exists(apk_path):
+                        if status_callback:
+                            status_callback(f"Skipping {pkg} (APK not found)")
+                        continue
+
+                    if status_callback:
+                        status_callback(f"Installing: {pkg} ({current_step}/{len(all_unique_apps)})")
+                    if progress_callback:
+                        progress_callback(current_step, total_steps, f"Installing {pkg}")
+
+                    success = self.adb.install_apk(serial, apk_path)
+                    if not success and status_callback:
+                        status_callback(f"WARNING: Failed to install {pkg}")
+
+                # Step 2: Remove apps from each profile that shouldn't have them
+                if status_callback:
+                    status_callback(f"\n--- Step 2: Configuring apps per user profile ---")
 
                 for user in device_users:
                     uid = int(user['id'])
                     uid_str = user['id']
-                    user_apps = user_app_map.get(uid_str, [])
-                    if selected_apps:
-                        user_apps = [a for a in user_apps if a in selected_apps]
+                    current_step += 1
 
-                    if not user_apps:
+                    apps_for_this_user = user_app_sets.get(uid_str, set())
+                    apps_to_remove = all_unique_apps - apps_for_this_user
+
+                    if not apps_to_remove:
                         if status_callback:
-                            status_callback(f"No apps to install for User {uid} ({user['name']})")
+                            status_callback(f"User {uid} ({user['name']}): keeping all {len(apps_for_this_user)} apps")
                         continue
 
                     if status_callback:
-                        status_callback(f"\n--- Installing {len(user_apps)} apps for User {uid} ({user['name']}) ---")
+                        status_callback(f"User {uid} ({user['name']}): removing {len(apps_to_remove)} apps not in this profile...")
 
-                    for pkg in user_apps:
-                        self._check_cancel()
-                        current_step += 1
+                    if progress_callback:
+                        progress_callback(current_step, total_steps, f"Configuring User {uid}")
 
-                        apk_path = os.path.join(apps_dir, f"{pkg}.apk")
-                        if not os.path.exists(apk_path):
-                            if status_callback:
-                                status_callback(f"Skipping {pkg} (APK not found)")
-                            continue
+                    removed = 0
+                    for pkg in apps_to_remove:
+                        ok = self.adb.uninstall_for_user(serial, pkg, uid)
+                        if ok:
+                            removed += 1
 
-                        if status_callback:
-                            status_callback(f"Installing: {pkg} → User {uid} ({current_step}/{total_installs})")
-                        if progress_callback:
-                            progress_callback(current_step, total_steps, f"Installing {pkg}")
+                    if status_callback:
+                        status_callback(f"  Removed {removed}/{len(apps_to_remove)} apps from User {uid}")
 
-                        # Install for specific user using ADB wrapper
-                        success = self.adb.install_apk_for_user(serial, apk_path, uid)
-                        if not success and status_callback:
-                            status_callback(f"WARNING: Failed to install {pkg} for User {uid}")
             else:
                 # Standard single-user restore
                 total_steps = len(apps_to_install) + 1
