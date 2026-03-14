@@ -269,6 +269,29 @@ class ADBWrapper:
         )
         return rc == 0 and "Success" in out
 
+    def install_apk_for_user_via_push(self, serial: str, apk_path: str, user_id: int) -> tuple:
+        """Install an APK for a specific user by pushing to device first.
+        Uses device-side pm install which respects --user more reliably.
+        Returns (success: bool, output: str)."""
+        remote_path = f"/data/local/tmp/{os.path.basename(apk_path)}"
+        # Push APK to device
+        rc, out, err = _run(
+            [self.adb, "-s", serial, "push", apk_path, remote_path],
+            timeout=120
+        )
+        if rc != 0:
+            return False, f"Push failed: {(out + err).strip()}"
+        # Install via pm on device for specific user
+        rc, out, err = _run(
+            [self.adb, "-s", serial, "shell", "pm", "install",
+             "-r", "--user", str(user_id), remote_path],
+            timeout=120
+        )
+        result = (out + err).strip()
+        # Cleanup temp file
+        _run([self.adb, "-s", serial, "shell", "rm", "-f", remote_path], timeout=10)
+        return rc == 0 and "Success" in result, result
+
     def uninstall_for_user(self, serial: str, package: str, user_id: int) -> tuple:
         """Uninstall a package for a specific user only.
         Returns (success: bool, output: str)."""

@@ -1149,9 +1149,21 @@ class ImagingEngine:
         self._cancel_flag = False
         temp_dir = tempfile.mkdtemp(prefix="gcloner_brestore_")
 
-        try:
+        # Open a diagnostic log file alongside the backup
+        log_dir = os.path.dirname(backup_path) or "."
+        log_path = os.path.join(log_dir, f"restore_diagnostic_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        diag_log = open(log_path, "w", encoding="utf-8")
+
+        def _log(msg):
+            """Write to both GUI status callback and diagnostic file."""
+            ts = time.strftime("%H:%M:%S")
+            diag_log.write(f"[{ts}] {msg}\n")
+            diag_log.flush()
             if status_callback:
-                status_callback("Extracting backup...")
+                status_callback(msg)
+
+        try:
+            _log("Extracting backup...")
 
             with zipfile.ZipFile(backup_path, "r") as zf:
                 zf.extractall(temp_dir)
@@ -1170,16 +1182,19 @@ class ImagingEngine:
             apps_to_install = selected_apps if selected_apps is not None else all_apps
             apps_dir = os.path.join(temp_dir, "apps")
 
+            _log(f"Backup manifest: {len(all_apps)} total apps, {len(user_app_map)} user profiles")
+            _log(f"User profiles in backup: {user_profiles}")
+            for uid_str, apps in user_app_map.items():
+                _log(f"  Backup User {uid_str}: {len(apps)} apps → {sorted(apps)}")
+
             # Determine target users on the device
             device_users = self.adb.list_users(serial)
-            if status_callback:
-                user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
-                status_callback(f"Target device has {len(device_users)} user profile(s): {user_names}")
+            user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
+            _log(f"Target device has {len(device_users)} user profile(s): {user_names}")
 
             # If backup has multiple user profiles, create missing ones on target
             if user_app_map and len(user_app_map) > 1 and user_profiles:
                 existing_ids = {u['id'] for u in device_users}
-                # Map from old user ID → new user ID (for profiles we create)
                 uid_remap = {}
 
                 for profile in user_profiles:
@@ -1187,47 +1202,40 @@ class ImagingEngine:
                     pname = profile.get('name', f'User {pid}')
 
                     if pid in existing_ids:
-                        uid_remap[pid] = pid  # already exists, no remap
+                        uid_remap[pid] = pid
+                        _log(f"User {pid} ({pname}) already exists on target")
                         continue
 
-                    # Skip creating user 0 (Owner) — always exists
                     if pid == '0':
                         uid_remap['0'] = '0'
                         continue
 
-                    if status_callback:
-                        status_callback(f"Creating user profile '{pname}' on target device...")
-
+                    _log(f"Creating user profile '{pname}' on target device...")
                     new_uid = self.adb.create_user(serial, pname)
                     if new_uid is not None:
                         uid_remap[pid] = str(new_uid)
-                        # Start the user so apps can be installed
                         self.adb.start_user(serial, new_uid)
-                        if status_callback:
-                            status_callback(f"  Created user '{pname}' (ID {new_uid})")
-                        time.sleep(2)  # Give system time to initialize user
+                        _log(f"  Created user '{pname}' (backup ID {pid} → target ID {new_uid})")
+                        time.sleep(3)
                     else:
-                        if status_callback:
-                            status_callback(f"  WARNING: Could not create user '{pname}' — apps for this profile will be skipped")
+                        _log(f"  WARNING: Could not create user '{pname}'")
 
-                # Refresh device users list after creating profiles
                 device_users = self.adb.list_users(serial)
-                if status_callback:
-                    user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
-                    status_callback(f"Target device now has {len(device_users)} user profile(s): {user_names}")
+                user_names = ", ".join(f"User {u['id']} ({u['name']})" for u in device_users)
+                _log(f"Target device now has {len(device_users)} profile(s): {user_names}")
+                _log(f"UID remap: {uid_remap}")
 
-                # Remap the user_app_map keys to match new user IDs on target
+                # Remap user_app_map, settings, permissions
                 remapped_app_map = {}
                 for old_uid, apps in user_app_map.items():
                     new_uid = uid_remap.get(old_uid)
                     if new_uid is not None:
                         remapped_app_map[new_uid] = apps
+                        _log(f"  Remapped apps: User {old_uid} → User {new_uid} ({len(apps)} apps)")
                     else:
-                        if status_callback:
-                            status_callback(f"  Skipping apps for backup User {old_uid} (profile not created)")
+                        _log(f"  Skipping apps for backup User {old_uid} (no remap)")
                 user_app_map = remapped_app_map
 
-                # Also remap user_settings and user_permissions
                 user_settings_raw = manifest.get("user_settings", {})
                 user_perms_raw = manifest.get("user_permissions", {})
                 remapped_settings = {}
@@ -1238,21 +1246,23 @@ class ImagingEngine:
                         remapped_settings[new_uid] = user_settings_raw[old_uid]
                     if old_uid in user_perms_raw:
                         remapped_perms[new_uid] = user_perms_raw[old_uid]
-                # Write back so the settings/permissions restore below uses remapped IDs
                 manifest['user_settings'] = remapped_settings
                 manifest['user_permissions'] = remapped_perms
 
             if user_app_map and len(user_app_map) > 1:
-                # Multi-user restore strategy:
-                # 1. Install ALL unique APKs globally (adb install makes apps available to all users)
-                # 2. Then UNINSTALL apps from each profile that shouldn't have them
-                # This is the only reliable way because adb install --user is often ignored
-                if status_callback:
-                    status_callback("Multi-user backup detected — installing apps then configuring per profile...")
+                # ══════════════════════════════════════════════
+                # MULTI-USER RESTORE — Per-user push + pm install
+                # Uses device-side pm install --user which properly
+                # respects the --user flag unlike host-side adb install
+                # ══════════════════════════════════════════════
+                _log("")
+                _log("=" * 50)
+                _log("MULTI-USER RESTORE — Per-user install via pm")
+                _log("=" * 50)
 
-                # Collect all unique packages and per-user app sets
+                # Build per-user app sets
+                user_app_sets = {}
                 all_unique_apps = set()
-                user_app_sets = {}  # uid_str -> set of packages
                 for user in device_users:
                     uid_str = user['id']
                     user_apps = user_app_map.get(uid_str, [])
@@ -1261,116 +1271,79 @@ class ImagingEngine:
                     user_app_sets[uid_str] = set(user_apps)
                     all_unique_apps.update(user_apps)
 
-                # ── DIAGNOSTIC: Show exactly what each profile should have ──
-                if status_callback:
-                    status_callback(f"\n{'='*50}")
-                    status_callback(f"DIAGNOSTIC: Backup contains {len(all_unique_apps)} unique apps across {len(user_app_sets)} profiles")
-                    for uid_str, apps in sorted(user_app_sets.items()):
-                        status_callback(f"  User {uid_str}: {len(apps)} apps")
-                        for a in sorted(apps):
-                            status_callback(f"    - {a}")
-                    # Show differences
-                    uid_list = sorted(user_app_sets.keys())
-                    if len(uid_list) == 2:
-                        u1, u2 = uid_list
-                        only_u1 = user_app_sets[u1] - user_app_sets[u2]
-                        only_u2 = user_app_sets[u2] - user_app_sets[u1]
-                        shared = user_app_sets[u1] & user_app_sets[u2]
-                        status_callback(f"\n  SHARED between both profiles: {len(shared)} apps")
-                        status_callback(f"  ONLY in User {u1}: {len(only_u1)} apps → {sorted(only_u1)}")
-                        status_callback(f"  ONLY in User {u2}: {len(only_u2)} apps → {sorted(only_u2)}")
-                    status_callback(f"{'='*50}\n")
+                # Show diagnostic info
+                _log(f"\nTarget app configuration:")
+                for uid_str, apps in sorted(user_app_sets.items()):
+                    _log(f"  User {uid_str}: {len(apps)} apps → {sorted(apps)}")
 
-                # Step 1: Install all unique APKs globally
-                total_steps = len(all_unique_apps) + len(device_users) + 1
+                uid_list = sorted(user_app_sets.keys())
+                if len(uid_list) == 2:
+                    u1, u2 = uid_list
+                    only_u1 = user_app_sets[u1] - user_app_sets[u2]
+                    only_u2 = user_app_sets[u2] - user_app_sets[u1]
+                    shared = user_app_sets[u1] & user_app_sets[u2]
+                    _log(f"\n  SHARED: {len(shared)} → {sorted(shared)}")
+                    _log(f"  ONLY User {u1}: {len(only_u1)} → {sorted(only_u1)}")
+                    _log(f"  ONLY User {u2}: {len(only_u2)} → {sorted(only_u2)}")
+
+                # Install apps per-user using push + pm install --user
+                total_installs = sum(len(apps) for apps in user_app_sets.values())
+                total_steps = total_installs + 2
                 current_step = 0
-
-                if status_callback:
-                    status_callback(f"--- Step 1: Installing {len(all_unique_apps)} unique apps (global install) ---")
-
-                installed_apps = set()
-                for pkg in sorted(all_unique_apps):
-                    self._check_cancel()
-                    current_step += 1
-
-                    apk_path = os.path.join(apps_dir, f"{pkg}.apk")
-                    if not os.path.exists(apk_path):
-                        if status_callback:
-                            status_callback(f"  SKIP {pkg} (APK file not in backup)")
-                        continue
-
-                    if status_callback:
-                        status_callback(f"  Installing: {pkg} ({current_step}/{len(all_unique_apps)})")
-                    if progress_callback:
-                        progress_callback(current_step, total_steps, f"Installing {pkg}")
-
-                    success = self.adb.install_apk(serial, apk_path)
-                    if success:
-                        installed_apps.add(pkg)
-                    elif status_callback:
-                        status_callback(f"  WARNING: Failed to install {pkg}")
-
-                if status_callback:
-                    status_callback(f"\n  Installed {len(installed_apps)}/{len(all_unique_apps)} apps globally")
-
-                # Step 2: Remove apps from each profile that shouldn't have them
-                if status_callback:
-                    status_callback(f"\n--- Step 2: Removing apps from profiles that shouldn't have them ---")
 
                 for user in device_users:
                     uid = int(user['id'])
                     uid_str = user['id']
-                    current_step += 1
+                    user_apps = sorted(user_app_sets.get(uid_str, set()))
 
-                    apps_for_this_user = user_app_sets.get(uid_str, set())
-                    # Only try to remove apps that were actually installed
-                    apps_to_remove = installed_apps - apps_for_this_user
-
-                    if status_callback:
-                        status_callback(f"\n  User {uid} ({user['name']}): should have {len(apps_for_this_user)} apps, removing {len(apps_to_remove)}")
-
-                    if not apps_to_remove:
-                        if status_callback:
-                            status_callback(f"    → Nothing to remove, keeping all apps")
+                    if not user_apps:
+                        _log(f"\nUser {uid} ({user['name']}): no apps to install")
                         continue
 
-                    if progress_callback:
-                        progress_callback(current_step, total_steps, f"Configuring User {uid}")
+                    _log(f"\n--- Installing {len(user_apps)} apps for User {uid} ({user['name']}) ---")
 
-                    removed = 0
-                    failed_removes = []
-                    for pkg in sorted(apps_to_remove):
-                        ok, output = self.adb.uninstall_for_user(serial, pkg, uid)
+                    installed = 0
+                    failed = 0
+                    for pkg in user_apps:
+                        self._check_cancel()
+                        current_step += 1
+
+                        apk_path = os.path.join(apps_dir, f"{pkg}.apk")
+                        if not os.path.exists(apk_path):
+                            _log(f"  SKIP {pkg} (APK not in backup)")
+                            continue
+
+                        if progress_callback:
+                            progress_callback(current_step, total_steps, f"User {uid}: {pkg}")
+
+                        # Use push + pm install --user for reliable per-user install
+                        ok, output = self.adb.install_apk_for_user_via_push(serial, apk_path, uid)
                         if ok:
-                            removed += 1
-                            if status_callback:
-                                status_callback(f"    ✓ Removed {pkg} from User {uid}")
+                            installed += 1
+                            _log(f"  OK {pkg} → User {uid}")
                         else:
-                            failed_removes.append((pkg, output))
-                            if status_callback:
-                                status_callback(f"    ✗ FAILED to remove {pkg} from User {uid}: {output}")
+                            failed += 1
+                            _log(f"  FAIL {pkg} → User {uid}: {output}")
 
-                    if status_callback:
-                        status_callback(f"    Result: {removed}/{len(apps_to_remove)} removed")
-                        if failed_removes:
-                            status_callback(f"    Failed: {[p for p, _ in failed_removes]}")
+                    _log(f"  User {uid} result: {installed} installed, {failed} failed")
 
-                # Step 3: Verify the result
-                if status_callback:
-                    status_callback(f"\n--- Step 3: Verifying app lists per profile ---")
-                    for user in device_users:
-                        uid = int(user['id'])
-                        actual_apps = self.adb.get_user_packages(serial, user_id=uid)
-                        expected = user_app_sets.get(user['id'], set())
-                        status_callback(f"  User {uid} ({user['name']}): {len(actual_apps)} apps installed (expected {len(expected)})")
-                        extra = set(actual_apps) - expected
-                        missing = expected - set(actual_apps)
-                        if extra:
-                            status_callback(f"    EXTRA apps (shouldn't be here): {sorted(extra)}")
-                        if missing:
-                            status_callback(f"    MISSING apps (should be here): {sorted(missing)}")
-                        if not extra and not missing:
-                            status_callback(f"    ✓ Perfect match!")
+                # Verify the result
+                _log(f"\n--- VERIFICATION ---")
+                for user in device_users:
+                    uid = int(user['id'])
+                    actual_apps = self.adb.get_user_packages(serial, user_id=uid)
+                    expected = user_app_sets.get(user['id'], set())
+                    _log(f"  User {uid} ({user['name']}): {len(actual_apps)} actual vs {len(expected)} expected")
+                    _log(f"    Actual:   {sorted(actual_apps)}")
+                    _log(f"    Expected: {sorted(expected)}")
+                    extra = set(actual_apps) - expected
+                    missing = expected - set(actual_apps)
+                    if extra:
+                        _log(f"    EXTRA (shouldn't be here): {sorted(extra)}")
+                    if missing:
+                        _log(f"    MISSING (should be here): {sorted(missing)}")
+                    if not extra and not missing:
+                        _log(f"    PERFECT MATCH!")
 
             else:
                 # Standard single-user restore
@@ -1383,18 +1356,16 @@ class ImagingEngine:
 
                     apk_path = os.path.join(apps_dir, f"{pkg}.apk")
                     if not os.path.exists(apk_path):
-                        if status_callback:
-                            status_callback(f"Skipping {pkg} (APK not found)")
+                        _log(f"Skipping {pkg} (APK not found)")
                         continue
 
-                    if status_callback:
-                        status_callback(f"Installing: {pkg} ({current_step}/{len(apps_to_install)})")
+                    _log(f"Installing: {pkg} ({current_step}/{len(apps_to_install)})")
                     if progress_callback:
                         progress_callback(current_step, total_steps, f"Installing {pkg}")
 
                     success = self.adb.install_apk(serial, apk_path)
-                    if not success and status_callback:
-                        status_callback(f"WARNING: Failed to install {pkg}")
+                    if not success:
+                        _log(f"WARNING: Failed to install {pkg}")
 
             # ── Restore per-user settings ──
             user_settings = manifest.get("user_settings", {})
@@ -1403,81 +1374,64 @@ class ImagingEngine:
             settings_applied = 0
 
             if user_settings or global_settings:
-                if status_callback:
-                    status_callback("\n--- Restoring system settings ---")
+                _log("\n--- Restoring system settings ---")
 
-                # Apply per-user settings (system + secure namespaces)
                 for user in device_users:
                     uid = int(user['id'])
                     uid_str = user['id']
                     u_settings = user_settings.get(uid_str, {})
-
                     if not u_settings:
                         continue
 
-                    if status_callback:
-                        status_callback(f"Applying settings for User {uid} ({user['name']})...")
-
+                    _log(f"Applying settings for User {uid} ({user['name']})...")
                     for ns in ("system", "secure"):
                         ns_settings = u_settings.get(ns, {})
                         for key, value in ns_settings.items():
                             self.adb.put_setting(serial, ns, key, value, user_id=uid)
                             settings_applied += 1
+                        if ns_settings:
+                            _log(f"  {ns}: {len(ns_settings)} settings applied")
 
-                        if ns_settings and status_callback:
-                            status_callback(f"  {ns}: {len(ns_settings)} settings applied")
-
-                # Apply global settings (shared across all users)
                 if global_settings:
-                    if status_callback:
-                        status_callback("Applying global settings...")
+                    _log("Applying global settings...")
                     for key, value in global_settings.items():
                         self.adb.put_setting(serial, "global", key, value)
                         settings_applied += 1
-                    if status_callback:
-                        status_callback(f"  global: {len(global_settings)} settings applied")
+                    _log(f"  global: {len(global_settings)} settings applied")
 
             # ── Restore app permissions ──
             perms_granted = 0
             if user_permissions:
-                if status_callback:
-                    status_callback("\n--- Restoring app permissions ---")
-
+                _log("\n--- Restoring app permissions ---")
                 for user in device_users:
                     uid = int(user['id'])
                     uid_str = user['id']
                     u_perms = user_permissions.get(uid_str, {})
-
                     if not u_perms:
                         continue
-
-                    if status_callback:
-                        status_callback(f"Granting permissions for User {uid}...")
-
+                    _log(f"Granting permissions for User {uid}...")
                     for pkg, perms in u_perms.items():
                         for perm in perms:
                             ok = self.adb.grant_permission(serial, pkg, perm, uid)
                             if ok:
                                 perms_granted += 1
-
-                    if status_callback:
-                        status_callback(f"  {perms_granted} permissions granted")
+                    _log(f"  {perms_granted} permissions granted")
 
             current_step = total_steps
             if progress_callback:
                 progress_callback(current_step, total_steps, "Done")
-            if status_callback:
-                status_callback(
-                    f"Backup restore complete!\n"
-                    f"Apps installed, {settings_applied} settings applied, "
-                    f"{perms_granted} permissions granted.\n"
-                    f"NOTE: App DATA (logins, saved content) requires root access.\n"
-                    f"You will need to re-login to apps, but system settings are restored."
-                )
+
+            _log(
+                f"\nRestore complete!\n"
+                f"Apps installed, {settings_applied} settings applied, "
+                f"{perms_granted} permissions granted.\n"
+                f"Diagnostic log saved to: {log_path}"
+            )
 
             return True
 
         finally:
+            diag_log.close()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     @staticmethod
