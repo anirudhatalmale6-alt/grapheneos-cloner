@@ -620,6 +620,7 @@ class ImagingEngine:
             bootloader_img = None
             radio_img = None
             inner_image_zip = None
+            avb_key = None
 
             for root, dirs, files in os.walk(temp_dir):
                 for f in files:
@@ -630,6 +631,8 @@ class ImagingEngine:
                         radio_img = full_path
                     elif f.endswith(".zip") and "image" in f.lower():
                         inner_image_zip = full_path
+                    elif f == "avb_pkmd.bin":
+                        avb_key = full_path
 
             if not inner_image_zip:
                 # Fallback: maybe it's a flat ZIP with .img files directly
@@ -652,9 +655,11 @@ class ImagingEngine:
                     found.append(f"radio ({os.path.basename(radio_img)})")
                 if inner_image_zip:
                     found.append(f"image archive ({os.path.basename(inner_image_zip)})")
+                if avb_key:
+                    found.append("AVB custom key (avb_pkmd.bin)")
                 status_callback(f"Found: {', '.join(found)}")
 
-            total_steps = 6
+            total_steps = 7  # bootloader + radio + system + AVB key + reboot + done
             current_step = 0
 
             # Step 1: Flash bootloader
@@ -843,9 +848,33 @@ class ImagingEngine:
                     self.fastboot.set_active_slot(serial, "a")
                     self.fastboot.erase_partition(serial, "userdata")
 
-            # Step 5: Reboot
-            if system_flashed:
+            # Step 5: Flash AVB custom key (required for bootloader locking)
+            # Without this, locking the bootloader causes "no valid OS" error
+            # because the bootloader can't verify GrapheneOS's signature
+            if system_flashed and avb_key:
                 current_step = 5
+                if progress_callback:
+                    progress_callback(current_step, total_steps, "Flashing AVB key")
+                if status_callback:
+                    status_callback("Flashing AVB custom key (enables bootloader locking)...")
+
+                ok = self.fastboot.flash_partition(serial, "avb_custom_key", avb_key)
+                if ok:
+                    result["flashed"].append("avb_custom_key")
+                    if status_callback:
+                        status_callback("  ✓ AVB custom key flashed — bootloader can be safely locked")
+                else:
+                    if status_callback:
+                        status_callback("  ✗ AVB key flash failed — bootloader locking may not work")
+                        status_callback("    You can still use the device with unlocked bootloader")
+            elif system_flashed and not avb_key:
+                if status_callback:
+                    status_callback("NOTE: No AVB key (avb_pkmd.bin) found in factory image.")
+                    status_callback("  Bootloader locking may not work without it.")
+
+            # Step 6: Reboot
+            if system_flashed:
+                current_step = 6
                 if progress_callback:
                     progress_callback(current_step, total_steps, "Rebooting device")
                 if status_callback:
@@ -853,7 +882,7 @@ class ImagingEngine:
                 self.fastboot.reboot(serial)
 
             # Final result
-            current_step = 6
+            current_step = 7
             if progress_callback:
                 progress_callback(current_step, total_steps, "Complete")
 
@@ -879,9 +908,12 @@ class ImagingEngine:
                     status_callback(result["message"])
             else:
                 result["success"] = True
+                avb_note = ""
+                if avb_key:
+                    avb_note = "\nAVB key installed — you can now safely lock the bootloader."
                 result["message"] = (
                     f"GrapheneOS flashed successfully! ({len(result['flashed'])} partitions)\n"
-                    "Device should boot into GrapheneOS setup screen."
+                    f"Device should boot into GrapheneOS setup screen.{avb_note}"
                 )
                 if status_callback:
                     status_callback(result["message"])
