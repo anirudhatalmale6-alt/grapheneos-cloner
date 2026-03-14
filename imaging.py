@@ -987,6 +987,60 @@ class ImagingEngine:
                     if status_callback:
                         status_callback(f"  Found {len(pkgs)} apps for User {uid}")
 
+            # ── Capture per-user system settings ──
+            # Settings that can be read/written via ADB without root
+            SKIP_SETTINGS = {
+                "android_id", "bluetooth_address", "advertising_id",
+                "install_non_market_apps",
+            }
+
+            user_settings_map = {}  # user_id -> {namespace -> {key: value}}
+            global_settings = {}
+
+            for user in target_users:
+                uid = int(user['id'])
+                if status_callback:
+                    status_callback(f"Capturing settings for User {uid} ({user['name']})...")
+
+                user_s = {}
+                for ns in ("system", "secure"):
+                    raw = self.adb.get_settings(serial, ns, user_id=uid)
+                    filtered = {k: v for k, v in raw.items()
+                                if k not in SKIP_SETTINGS and v != "null"}
+                    user_s[ns] = filtered
+                    if status_callback:
+                        status_callback(f"  {ns}: {len(filtered)} settings captured")
+
+                user_settings_map[str(uid)] = user_s
+
+            # Global settings (shared across users, capture once)
+            if status_callback:
+                status_callback("Capturing global settings...")
+            raw_global = self.adb.get_settings(serial, "global")
+            global_settings = {k: v for k, v in raw_global.items()
+                               if k not in SKIP_SETTINGS and v != "null"}
+            if status_callback:
+                status_callback(f"  global: {len(global_settings)} settings captured")
+
+            # ── Capture per-app permissions ──
+            user_permissions_map = {}  # user_id -> {package -> [permissions]}
+            if include_apps:
+                for user in target_users:
+                    uid = int(user['id'])
+                    uid_str = str(uid)
+                    user_perms = {}
+                    pkgs = user_app_map.get(uid_str, [])
+                    if pkgs and status_callback:
+                        status_callback(f"Capturing app permissions for User {uid}...")
+                    for pkg in pkgs:
+                        perms = self.adb.get_granted_permissions(serial, pkg, uid)
+                        if perms:
+                            user_perms[pkg] = perms
+                    user_permissions_map[uid_str] = user_perms
+                    if status_callback and pkgs:
+                        apps_with_perms = sum(1 for p in user_perms.values() if p)
+                        status_callback(f"  {apps_with_perms} apps have granted permissions")
+
             total_apps = len(all_apks_needed)
             total_steps = total_apps + 3 if include_apps else 3
             current_step = 0
@@ -1008,7 +1062,7 @@ class ImagingEngine:
                     apk_path = os.path.join(apps_dir, f"{pkg}.apk")
                     self.adb.backup_app(serial, pkg, apk_path)
 
-            # Create manifest with per-user app lists
+            # Create manifest with per-user app lists, settings, and permissions
             current_step += 1
             if progress_callback:
                 progress_callback(current_step, total_steps, "Creating manifest")
@@ -1024,7 +1078,10 @@ class ImagingEngine:
                 "app_list": flat_app_list,
                 "user_profiles": [{"id": u["id"], "name": u["name"]} for u in target_users],
                 "user_app_map": user_app_map,
-                "version": "2.0",
+                "user_settings": user_settings_map,
+                "global_settings": global_settings,
+                "user_permissions": user_permissions_map,
+                "version": "3.0",
             }
 
             with open(os.path.join(temp_dir, "manifest.json"), "w") as f:
@@ -1050,12 +1107,18 @@ class ImagingEngine:
                         arcname = os.path.relpath(full, temp_dir)
                         zf.write(full, arcname)
 
+            total_settings = sum(
+                sum(len(v) for v in ns.values())
+                for ns in user_settings_map.values()
+            ) + len(global_settings)
+
             if status_callback:
                 status_callback(
                     f"Backup created: {backup_name}\n"
-                    f"Profiles backed up: {n_users} | Total unique apps: {total_apps}\n"
-                    f"NOTE: APKs are backed up but app DATA (settings, logins) requires root access "
-                    f"which GrapheneOS does not provide. You will need to re-login to apps after restore."
+                    f"Profiles: {n_users} | Apps: {total_apps} | Settings: {total_settings}\n"
+                    f"Includes: APKs, system/secure/global settings, app permissions per profile.\n"
+                    f"NOTE: App DATA (logins, saved content) requires root which GrapheneOS blocks.\n"
+                    f"You will need to re-login to apps after restore, but settings will be applied."
                 )
 
             return backup_path
@@ -1185,14 +1248,83 @@ class ImagingEngine:
                     if not success and status_callback:
                         status_callback(f"WARNING: Failed to install {pkg}")
 
+            # ── Restore per-user settings ──
+            user_settings = manifest.get("user_settings", {})
+            global_settings = manifest.get("global_settings", {})
+            user_permissions = manifest.get("user_permissions", {})
+            settings_applied = 0
+
+            if user_settings or global_settings:
+                if status_callback:
+                    status_callback("\n--- Restoring system settings ---")
+
+                # Apply per-user settings (system + secure namespaces)
+                for user in device_users:
+                    uid = int(user['id'])
+                    uid_str = user['id']
+                    u_settings = user_settings.get(uid_str, {})
+
+                    if not u_settings:
+                        continue
+
+                    if status_callback:
+                        status_callback(f"Applying settings for User {uid} ({user['name']})...")
+
+                    for ns in ("system", "secure"):
+                        ns_settings = u_settings.get(ns, {})
+                        for key, value in ns_settings.items():
+                            self.adb.put_setting(serial, ns, key, value, user_id=uid)
+                            settings_applied += 1
+
+                        if ns_settings and status_callback:
+                            status_callback(f"  {ns}: {len(ns_settings)} settings applied")
+
+                # Apply global settings (shared across all users)
+                if global_settings:
+                    if status_callback:
+                        status_callback("Applying global settings...")
+                    for key, value in global_settings.items():
+                        self.adb.put_setting(serial, "global", key, value)
+                        settings_applied += 1
+                    if status_callback:
+                        status_callback(f"  global: {len(global_settings)} settings applied")
+
+            # ── Restore app permissions ──
+            perms_granted = 0
+            if user_permissions:
+                if status_callback:
+                    status_callback("\n--- Restoring app permissions ---")
+
+                for user in device_users:
+                    uid = int(user['id'])
+                    uid_str = user['id']
+                    u_perms = user_permissions.get(uid_str, {})
+
+                    if not u_perms:
+                        continue
+
+                    if status_callback:
+                        status_callback(f"Granting permissions for User {uid}...")
+
+                    for pkg, perms in u_perms.items():
+                        for perm in perms:
+                            ok = self.adb.grant_permission(serial, pkg, perm, uid)
+                            if ok:
+                                perms_granted += 1
+
+                    if status_callback:
+                        status_callback(f"  {perms_granted} permissions granted")
+
             current_step = total_steps
             if progress_callback:
                 progress_callback(current_step, total_steps, "Done")
             if status_callback:
                 status_callback(
-                    "Backup restore complete!\n"
-                    "NOTE: App DATA (settings, logins, saved content) is NOT included in the backup.\n"
-                    "You will need to log into apps and configure settings manually on each profile."
+                    f"Backup restore complete!\n"
+                    f"Apps installed, {settings_applied} settings applied, "
+                    f"{perms_granted} permissions granted.\n"
+                    f"NOTE: App DATA (logins, saved content) requires root access.\n"
+                    f"You will need to re-login to apps, but system settings are restored."
                 )
 
             return True

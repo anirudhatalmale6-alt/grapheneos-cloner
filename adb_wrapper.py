@@ -250,6 +250,63 @@ class ADBWrapper:
         )
         return rc == 0 and "Success" in out
 
+    def get_settings(self, serial: str, namespace: str,
+                     user_id: Optional[int] = None) -> Dict[str, str]:
+        """Get all settings from a namespace (system, secure, global).
+        Returns dict of key=value pairs.
+        Per-user settings supported for 'system' and 'secure' namespaces."""
+        cmd = [self.adb, "-s", serial, "shell", "settings", "list", namespace]
+        if user_id is not None and namespace in ("system", "secure"):
+            cmd = [self.adb, "-s", serial, "shell", "settings",
+                   "--user", str(user_id), "list", namespace]
+        rc, out, err = _run(cmd, timeout=30)
+        if rc != 0:
+            return {}
+        settings = {}
+        for line in out.strip().split("\n"):
+            line = line.strip()
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key:
+                    settings[key] = value.strip()
+        return settings
+
+    def put_setting(self, serial: str, namespace: str, key: str, value: str,
+                    user_id: Optional[int] = None) -> bool:
+        """Set a single setting value.
+        Per-user settings supported for 'system' and 'secure' namespaces."""
+        cmd = [self.adb, "-s", serial, "shell", "settings", "put", namespace, key, value]
+        if user_id is not None and namespace in ("system", "secure"):
+            cmd = [self.adb, "-s", serial, "shell", "settings",
+                   "--user", str(user_id), "put", namespace, key, value]
+        rc, out, err = _run(cmd, timeout=10)
+        return rc == 0
+
+    def get_granted_permissions(self, serial: str, package: str,
+                                user_id: int = 0) -> List[str]:
+        """Get list of runtime permissions granted to an app."""
+        rc, out = self.shell(serial,
+                             f"dumpsys package {package} | grep 'granted=true'")
+        if rc != 0:
+            return []
+        perms = []
+        for line in out.strip().split("\n"):
+            line = line.strip()
+            # Format: android.permission.CAMERA: granted=true
+            if "granted=true" in line:
+                perm = line.split(":")[0].strip()
+                if perm.startswith("android.permission.") or perm.startswith("com."):
+                    perms.append(perm)
+        return perms
+
+    def grant_permission(self, serial: str, package: str, permission: str,
+                         user_id: int = 0) -> bool:
+        """Grant a runtime permission to an app."""
+        cmd = f"pm grant --user {user_id} {package} {permission}"
+        rc, out = self.shell(serial, cmd)
+        return rc == 0
+
     def wait_for_device(self, serial: str, timeout: int = 60) -> bool:
         """Wait for device to come online."""
         rc, out, err = _run([self.adb, "-s", serial, "wait-for-device"], timeout=timeout)
